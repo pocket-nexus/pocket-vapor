@@ -2275,16 +2275,21 @@ class AppCompiler {
     // handler
     c.push(`void app_on_button(u8 b) {\n  s32 b_arg = (s32)b;\n${handlerOut.join("\n")}\n}\n`);
     c.push(axisHandlerFns.join("\n\n"));
-    if (axisHandlerCases.length > 0) {
-      c.push(
-        `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
-          "\n",
-        )}\n    default: break;\n  }\n}\n`,
-      );
-    } else {
-      c.push(
-        "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
-      );
+    // Only Playdate's runtime calls app_on_axis_delta unconditionally; the
+    // console/ESP32 runtimes never reference it, and their targets reject axis
+    // registrations at compile time (VT102), so no definition is emitted there.
+    if (axisHandlerCases.length > 0 || this.target.name === "playdate") {
+      if (axisHandlerCases.length > 0) {
+        c.push(
+          `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
+            "\n",
+          )}\n    default: break;\n  }\n}\n`,
+        );
+      } else {
+        c.push(
+          "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
+        );
+      }
     }
 
     // flush
@@ -2327,7 +2332,9 @@ class AppCompiler {
       throw new Error(this.styleErrors.join("\n"));
     }
     c.push(emitTargetData(this.target, this.styleTable));
-    c.push(`const char vp_app_title[] = "${this.escC(this.title)}";`);
+    // No C symbol for the cartridge title: the GBA/GB header patches write
+    // the bytes from app.title on the JS side (rom.ts), and none of the
+    // runtimes read it (Playdate uses app.title for its bundle metadata).
     c.push("");
 
     // ---- reports ----
@@ -2382,14 +2389,13 @@ class AppCompiler {
     const scalarBytes = this.refs
       .filter((r) => r.refTy !== "list")
       .reduce((a, r) => a + (r.refTy === "str" ? this.target.strCap + 1 : 4), 0);
-    const romStrings =
-      [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0) + this.title.length + 1;
+    const romStrings = [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0);
     const pairCount = this.styleTable.pairs.length;
     const fontBytes =
       this.target.name === "esp32" || this.target.name === "playdate" ? 95 * 8 : 95 * 32;
     const styleBytes =
       this.target.name === "gba"
-        ? pairCount * 16 * 2 + pairCount + 3
+        ? pairCount * 16 * 2 + 2 // palette banks + palette_count/backdrop; no vp_pal_style
         : this.target.name === "esp32"
           ? pairCount * 2 * 2 + pairCount + 2
           : pairCount;
@@ -2501,6 +2507,9 @@ export function nesFontBytes(): number[] {
 
 function emitTargetData(target: VaporTarget, styles: StyleTable): string {
   const lowered = styles.lower(target.name);
+  // GB, NES and Playdate index glyph style through this table at render time;
+  // GBA and ESP32 read palette banks / RGB565 pairs directly, so they never
+  // emit it.
   const styleTable = `const u8 vp_pal_style[${styles.pairs.length}] = { ${lowered.styleMap.join(",")} };`;
 
   switch (target.name) {
@@ -2516,8 +2525,7 @@ function emitTargetData(target: VaporTarget, styles: StyleTable): string {
         `${emitFontGba()}\n` +
         `const u16 vp_palettes[] = { ${banks.join(",")} };\n` +
         `const u8 vp_palette_count = ${styles.pairs.length};\n` +
-        `const u16 vp_backdrop = ${rgb555(BACKDROP)};\n` +
-        styleTable
+        `const u16 vp_backdrop = ${rgb555(BACKDROP)};`
       );
     }
     case "esp32": {

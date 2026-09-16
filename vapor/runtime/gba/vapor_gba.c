@@ -31,17 +31,11 @@
 u8 vp_grid_ch[VP_GRID_H][VP_GRID_W];
 u8 vp_grid_pal[VP_GRID_H][VP_GRID_W];
 
-/* Freestanding: gcc lowers struct assignment to memcpy/memset calls. */
+/* Freestanding: gcc lowers struct assignment to memcpy calls. */
 void *memcpy(void *dst, const void *src, unsigned long n) {
   u8 *d = (u8 *)dst;
   const u8 *s = (const u8 *)src;
   while (n--) *d++ = *s++;
-  return dst;
-}
-
-void *memset(void *dst, int v, unsigned long n) {
-  u8 *d = (u8 *)dst;
-  while (n--) *d++ = (u8)v;
   return dst;
 }
 
