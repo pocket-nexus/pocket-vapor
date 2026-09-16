@@ -1,6 +1,8 @@
 // vapor/test/compiler.test.ts — subset diagnostics + deterministic output.
 
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadBoard } from "../compiler/boards.ts";
 import { compileVaporApp, VAPOR_TARGETS, VaporCompileError } from "../compiler/compile.ts";
@@ -8,6 +10,7 @@ import { esp32BuildId } from "../compiler/esp32.ts";
 import { FONT8 } from "../compiler/font.gen.ts";
 
 const ENTRY = join(import.meta.dir, "..", "examples", "todo", "todo.tsx");
+const TODO_SOURCE = await Bun.file(ENTRY).text();
 
 const HEADER = `
 import { computed, ref } from "vue";
@@ -265,5 +268,62 @@ export default () => {
 `;
     const msg = compileErr(source);
     expect(msg).toContain("derive from the same list");
+  });
+});
+
+// Dead data/functions: nm + grep showed no runtime reads (fleet task 822,
+// scout task-764 §4.2). The cartridge title ships via JS-side header patches
+// (rom.ts); GBA reads palette banks directly; the console runtimes never call
+// app_on_axis_delta and reject axis registrations at compile time (VT102).
+describe("dead data and dead functions are not emitted", () => {
+  for (const target of ["gba", "gb", "nes", "esp32"] as const) {
+    test(`${target}: generated C omits title and axis stub`, () => {
+      const app = compileVaporApp(ENTRY, TODO_SOURCE, "VAPOR TODO", target);
+      expect(app.c).not.toContain("vp_app_title");
+      expect(app.c).not.toContain("app_on_axis_delta");
+    });
+  }
+
+  test("gba omits vp_pal_style while gb/nes/playdate keep it", async () => {
+    const gba = compileVaporApp(ENTRY, TODO_SOURCE, "VAPOR TODO", "gba");
+    expect(gba.c).not.toContain("vp_pal_style");
+    expect(gba.plan).toContain("203 B strings + 3040 B font + 194 B style data");
+    for (const target of ["gb", "nes"] as const) {
+      const app = compileVaporApp(ENTRY, TODO_SOURCE, "VAPOR TODO", target);
+      expect(app.c).toContain("const u8 vp_pal_style[6]");
+      expect(app.plan).toContain("187 B strings + 3040 B font + 6 B style data");
+    }
+    const playdateSix = await Bun.file(
+      join(import.meta.dir, "..", "examples", "playdate-six-button", "playdate-six-button.tsx"),
+    ).text();
+    const playdate = compileVaporApp("six.tsx", playdateSix, "PLAYDATE SIX", "playdate");
+    expect(playdate.c).toContain("const u8 vp_pal_style[3]");
+    // playdate's runtime calls app_on_axis_delta unconditionally: the stub
+    // stays even when the app registers no handler; the title still does not.
+    expect(playdate.c).toContain("void app_on_axis_delta(u8 axis, s32 delta)");
+    expect(playdate.c).not.toContain("vp_app_title");
+  });
+
+  const armGcc = Bun.which("arm-none-eabi-gcc");
+  const armNm = Bun.which("arm-none-eabi-nm");
+  (armGcc && armNm ? test : test.skip)("gba link keeps no dead symbols", async () => {
+    const { buildGbaRom } = await import("../compiler/rom.ts");
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-deadsym-"));
+    try {
+      const app = compileVaporApp(ENTRY, TODO_SOURCE, "VAPOR TODO", "gba");
+      const rom = join(dir, "todo.gba");
+      await buildGbaRom(app, rom);
+      const elf = join(dir, "gen-gba", "app.elf");
+      const out = await Bun.$`arm-none-eabi-nm ${elf}`.quiet().text();
+      const names = out.trim().split("\n").map((line) => line.split(" ").slice(-1)[0]);
+      expect(names).not.toContain("memset");
+      expect(names).not.toContain("vp_app_title");
+      expect(names).not.toContain("vp_pal_style");
+      expect(names).not.toContain("app_on_axis_delta");
+      // memcpy stays: struct assignment still lowers to it.
+      expect(names).toContain("memcpy");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
