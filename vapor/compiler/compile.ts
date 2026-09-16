@@ -310,6 +310,43 @@ class AppCompiler {
     set.add(callee);
   }
 
+  /** Targets whose C ABI pads structs to 4-byte alignment: arm-none-eabi-gcc
+   * (GBA), Xtensa gcc (ESP32) and the Playdate builds (arm-eabi-gcc device,
+   * host clang simulator). sdcc (SM83) and cc65 (6502) pack byte-tight. */
+  private get paddedAbi(): boolean {
+    return (
+      this.target.name === "gba" ||
+      this.target.name === "esp32" ||
+      this.target.name === "playdate"
+    );
+  }
+
+  /**
+   * Field order for a generated record typedef. Padding ABIs get a stable
+   * ordering by descending alignment — s32 (4) before vp_sb/u8 (1) — so a
+   * 1-byte field never forces 3 pad bytes before a later s32; fields of the
+   * same alignment keep interface source order. Generated code reaches
+   * fields by name, so the order has no semantic effect. Tight-packing
+   * targets keep source order.
+   */
+  private recordFields(iface: IfaceShape): IfaceShape["fields"] {
+    if (!this.paddedAbi) return iface.fields;
+    const wide = iface.fields.filter((f) => f.ty === "num");
+    const narrow = iface.fields.filter((f) => f.ty !== "num");
+    return [...wide, ...narrow];
+  }
+
+  /** Size of one record slot under the target C ABI. The only align-4 member
+   * is s32 (vp_sb is u8 + char[], align 1): with s32 fields emitted first
+   * the slot needs tail padding only when the record contains one. */
+  private recordStride(iface: IfaceShape): number {
+    const raw = iface.fields.reduce(
+      (a, f) => a + (f.ty === "str" ? this.target.strCap + 1 : f.ty === "bool" ? 1 : 4),
+      0,
+    );
+    return this.paddedAbi && iface.fields.some((f) => f.ty === "num") ? (raw + 3) & ~3 : raw;
+  }
+
   /** Color temporaries into shared static slots; returns decls + name map. */
   private ovlAssign(): { decls: string[]; names: Map<number, string>; slotBytes: number } {
     // transitive reachability over owners
@@ -2239,7 +2276,7 @@ class AppCompiler {
 
     // record structs
     for (const iface of this.ifaces.values()) {
-      const fields = iface.fields
+      const fields = this.recordFields(iface)
         .map((f) => (f.ty === "str" ? `vp_sb ${f.name};` : f.ty === "bool" ? `u8 ${f.name};` : `s32 ${f.name};`))
         .join(" ");
       c.push(`typedef struct { ${fields} } rec_${iface.name.toLowerCase()};`);
@@ -2381,8 +2418,7 @@ class AppCompiler {
     const pools = this.refs.filter((r) => r.refTy === "list");
     const poolBytes = pools.reduce((acc, p) => {
       const iface = this.ifaces.get(p.iface!)!;
-      const rec = iface.fields.reduce((a, f) => a + (f.ty === "str" ? this.target.strCap + 1 : f.ty === "bool" ? 1 : 4), 0);
-      return acc + rec * this.target.poolCap + 1;
+      return acc + this.recordStride(iface) * this.target.poolCap + 1;
     }, 0);
     const viewBytes =
       this.computeds.filter((comp) => comp.valTy.k === "view").length * (this.target.poolCap + 1);
