@@ -310,6 +310,43 @@ class AppCompiler {
     set.add(callee);
   }
 
+  /** Targets whose C ABI pads structs to 4-byte alignment: arm-none-eabi-gcc
+   * (GBA), Xtensa gcc (ESP32) and the Playdate builds (arm-eabi-gcc device,
+   * host clang simulator). sdcc (SM83) and cc65 (6502) pack byte-tight. */
+  private get paddedAbi(): boolean {
+    return (
+      this.target.name === "gba" ||
+      this.target.name === "esp32" ||
+      this.target.name === "playdate"
+    );
+  }
+
+  /**
+   * Field order for a generated record typedef. Padding ABIs get a stable
+   * ordering by descending alignment — s32 (4) before vp_sb/u8 (1) — so a
+   * 1-byte field never forces 3 pad bytes before a later s32; fields of the
+   * same alignment keep interface source order. Generated code reaches
+   * fields by name, so the order has no semantic effect. Tight-packing
+   * targets keep source order.
+   */
+  private recordFields(iface: IfaceShape): IfaceShape["fields"] {
+    if (!this.paddedAbi) return iface.fields;
+    const wide = iface.fields.filter((f) => f.ty === "num");
+    const narrow = iface.fields.filter((f) => f.ty !== "num");
+    return [...wide, ...narrow];
+  }
+
+  /** Size of one record slot under the target C ABI. The only align-4 member
+   * is s32 (vp_sb is u8 + char[], align 1): with s32 fields emitted first
+   * the slot needs tail padding only when the record contains one. */
+  private recordStride(iface: IfaceShape): number {
+    const raw = iface.fields.reduce(
+      (a, f) => a + (f.ty === "str" ? this.target.strCap + 1 : f.ty === "bool" ? 1 : 4),
+      0,
+    );
+    return this.paddedAbi && iface.fields.some((f) => f.ty === "num") ? (raw + 3) & ~3 : raw;
+  }
+
   /** Color temporaries into shared static slots; returns decls + name map. */
   private ovlAssign(): { decls: string[]; names: Map<number, string>; slotBytes: number } {
     // transitive reachability over owners
@@ -2239,7 +2276,7 @@ class AppCompiler {
 
     // record structs
     for (const iface of this.ifaces.values()) {
-      const fields = iface.fields
+      const fields = this.recordFields(iface)
         .map((f) => (f.ty === "str" ? `vp_sb ${f.name};` : f.ty === "bool" ? `u8 ${f.name};` : `s32 ${f.name};`))
         .join(" ");
       c.push(`typedef struct { ${fields} } rec_${iface.name.toLowerCase()};`);
@@ -2275,16 +2312,21 @@ class AppCompiler {
     // handler
     c.push(`void app_on_button(u8 b) {\n  s32 b_arg = (s32)b;\n${handlerOut.join("\n")}\n}\n`);
     c.push(axisHandlerFns.join("\n\n"));
-    if (axisHandlerCases.length > 0) {
-      c.push(
-        `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
-          "\n",
-        )}\n    default: break;\n  }\n}\n`,
-      );
-    } else {
-      c.push(
-        "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
-      );
+    // Only Playdate's runtime calls app_on_axis_delta unconditionally; the
+    // console/ESP32 runtimes never reference it, and their targets reject axis
+    // registrations at compile time (VT102), so no definition is emitted there.
+    if (axisHandlerCases.length > 0 || this.target.name === "playdate") {
+      if (axisHandlerCases.length > 0) {
+        c.push(
+          `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
+            "\n",
+          )}\n    default: break;\n  }\n}\n`,
+        );
+      } else {
+        c.push(
+          "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
+        );
+      }
     }
 
     // flush
@@ -2327,7 +2369,9 @@ class AppCompiler {
       throw new Error(this.styleErrors.join("\n"));
     }
     c.push(emitTargetData(this.target, this.styleTable));
-    c.push(`const char vp_app_title[] = "${this.escC(this.title)}";`);
+    // No C symbol for the cartridge title: the GBA/GB header patches write
+    // the bytes from app.title on the JS side (rom.ts), and none of the
+    // runtimes read it (Playdate uses app.title for its bundle metadata).
     c.push("");
 
     // ---- reports ----
@@ -2374,22 +2418,20 @@ class AppCompiler {
     const pools = this.refs.filter((r) => r.refTy === "list");
     const poolBytes = pools.reduce((acc, p) => {
       const iface = this.ifaces.get(p.iface!)!;
-      const rec = iface.fields.reduce((a, f) => a + (f.ty === "str" ? this.target.strCap + 1 : f.ty === "bool" ? 1 : 4), 0);
-      return acc + rec * this.target.poolCap + 1;
+      return acc + this.recordStride(iface) * this.target.poolCap + 1;
     }, 0);
     const viewBytes =
       this.computeds.filter((comp) => comp.valTy.k === "view").length * (this.target.poolCap + 1);
     const scalarBytes = this.refs
       .filter((r) => r.refTy !== "list")
       .reduce((a, r) => a + (r.refTy === "str" ? this.target.strCap + 1 : 4), 0);
-    const romStrings =
-      [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0) + this.title.length + 1;
+    const romStrings = [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0);
     const pairCount = this.styleTable.pairs.length;
     const fontBytes =
       this.target.name === "esp32" || this.target.name === "playdate" ? 95 * 8 : 95 * 32;
     const styleBytes =
       this.target.name === "gba"
-        ? pairCount * 16 * 2 + pairCount + 3
+        ? pairCount * 16 * 2 + 2 // palette banks + palette_count/backdrop; no vp_pal_style
         : this.target.name === "esp32"
           ? pairCount * 2 * 2 + pairCount + 2
           : pairCount;
@@ -2501,6 +2543,9 @@ export function nesFontBytes(): number[] {
 
 function emitTargetData(target: VaporTarget, styles: StyleTable): string {
   const lowered = styles.lower(target.name);
+  // GB, NES and Playdate index glyph style through this table at render time;
+  // GBA and ESP32 read palette banks / RGB565 pairs directly, so they never
+  // emit it.
   const styleTable = `const u8 vp_pal_style[${styles.pairs.length}] = { ${lowered.styleMap.join(",")} };`;
 
   switch (target.name) {
@@ -2516,8 +2561,7 @@ function emitTargetData(target: VaporTarget, styles: StyleTable): string {
         `${emitFontGba()}\n` +
         `const u16 vp_palettes[] = { ${banks.join(",")} };\n` +
         `const u8 vp_palette_count = ${styles.pairs.length};\n` +
-        `const u16 vp_backdrop = ${rgb555(BACKDROP)};\n` +
-        styleTable
+        `const u16 vp_backdrop = ${rgb555(BACKDROP)};`
       );
     }
     case "esp32": {
