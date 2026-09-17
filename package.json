@@ -26,7 +26,8 @@
     "test": "bun test vapor/tests/ --max-concurrency 1 --timeout 120000",
     "typecheck": "tsc --noEmit -p vapor",
     "test:core": "bun test vapor/tests/boards.test.ts vapor/tests/compiler.test.ts vapor/tests/oracle.test.ts vapor/tests/overlay.test.ts vapor/tests/playdate.test.ts vapor/tests/sccp.test.ts vapor/tests/styles.test.ts --max-concurrency 1 --timeout 120000",
-    "vapor:playdate:smoke": "bun vapor/compiler/cli.ts vapor/examples/playdate-six-button/playdate-six-button.tsx --target playdate --playdate-mode simulator"
+    "vapor:playdate:smoke": "bun vapor/compiler/cli.ts vapor/examples/playdate-six-button/playdate-six-button.tsx --target playdate --playdate-mode simulator",
+    "gba:imagegen": "bun tools/gba-imagegen.ts"
   },
   "dependencies": {
     "vue": "3.6.0-rc.1",

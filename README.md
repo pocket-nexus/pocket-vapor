@@ -29,6 +29,14 @@ bun test vapor/tests/ --max-concurrency 1 --timeout 120000
 
 Console parity needs ARM GCC, SDCC with SM83 support, RGBDS, cc65, clang and libmgba. The libmgba harness discovers Homebrew by default; set `MGBA_PREFIX` elsewhere. Set `CC65_LIB` to the path of `none.lib` when it is not under `/opt/homebrew/share/cc65/lib/`. ESP32 firmware and Playdate packages need their respective SDKs. Host tests do not prove physical-device behavior.
 
+## Optional GBA source art
+
+`bun run gba:imagegen --out dist/imagegen/gba-source.png --dry-run` previews the
+asset prompt. Omit `--dry-run` to use a locally authenticated Codex app-server
+and ImageGen. This optional tool produces PNG source art; the repository does
+not include a bitmap-to-cartridge extractor. Its workflow is documented in
+[the migrated skill](skills/pocketjs-gba-imagegen/SKILL.md).
+
 ## Source and documentation
 
 - [Compiler, examples, commands and runtime layout](vapor/README.md)
