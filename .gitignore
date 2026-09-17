@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.cache/
+.pocket-build/
+.DS_Store
+vapor/tests/harness/mgba_runner

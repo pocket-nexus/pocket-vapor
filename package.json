@@ -1,0 +1,44 @@
+{
+  "name": "pocket-vapor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Early experimental TypeScript-to-native UI compiler; not a PocketJS mainline feature.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pocket-stack/pocket-vapor.git"
+  },
+  "scripts": {
+    "vapor": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx",
+    "vapor:play": "bun vapor/scripts/play.ts",
+    "vapor:test": "bun test vapor/tests/",
+    "vapor:gb": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx --target gb",
+    "vapor:nes": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx --target nes",
+    "vapor:esp32": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx --target esp32",
+    "vapor:playdate": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.playdate.tsx --target playdate --playdate-mode simulator",
+    "vapor:playdate:device": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.playdate.tsx --target playdate --playdate-mode device",
+    "vapor:playdate:both": "bun vapor/compiler/cli.ts vapor/examples/todo/todo.playdate.tsx --target playdate --playdate-mode both",
+    "vapor:esp32:flash": "bun vapor/scripts/esp32.ts flash",
+    "vapor:esp32:verify": "bun vapor/scripts/esp32.ts verify",
+    "vapor:dev": "bun vapor/scripts/dev.ts",
+    "vapor:check": "bun vapor/compiler/cli.ts check vapor/examples/todo/todo.tsx",
+    "test": "bun test vapor/tests/ --max-concurrency 1 --timeout 120000",
+    "typecheck": "tsc --noEmit -p vapor",
+    "test:core": "bun test vapor/tests/boards.test.ts vapor/tests/compiler.test.ts vapor/tests/oracle.test.ts vapor/tests/overlay.test.ts vapor/tests/playdate.test.ts vapor/tests/sccp.test.ts vapor/tests/styles.test.ts --max-concurrency 1 --timeout 120000",
+    "vapor:playdate:smoke": "bun vapor/compiler/cli.ts vapor/examples/playdate-six-button/playdate-six-button.tsx --target playdate --playdate-mode simulator"
+  },
+  "dependencies": {
+    "vue": "3.6.0-rc.1",
+    "vue-jsx-vapor": "3.2.19"
+  },
+  "devDependencies": {
+    "@babel/core": "^7",
+    "@babel/preset-typescript": "^7",
+    "@types/babel__core": "^7.20.5",
+    "@types/bun": "^1.2",
+    "typescript": "^5",
+    "jsnes": "^2.1.0",
+    "@napi-rs/canvas": "^1.0.2"
+  }
+}
