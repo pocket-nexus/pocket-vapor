@@ -563,6 +563,114 @@ export default () => {
   });
 });
 
+// char vs one-character string literal: JS sees both as the one-char string
+// "#", but in C the left side is a `char` and the literal is a ROM array
+// `const char[2]` — sdcc and cc65 reject that comparison outright, gcc only
+// warns. The compiler lowers the single-char literal side to a C char
+// literal ('#'); a multi-char literal against a char is meaningless and is a
+// frontend diagnostic instead.
+describe("char compared to a one-character string literal (D207)", () => {
+  const cmp = (expr: string) => `${HEADER}
+const ROW = "#.";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "#." }]);
+  const x = ref(0);
+  const n = ref(0);
+  onButton((b) => {
+    if (b === Button.A) x.value = 1;
+    const t = rows.value[0];
+    if (t && ${expr}) n.value = 1;
+  });
+  return (<><row y={0}>{n.value}</row></>);
+};
+`;
+
+  test("lowers char === \"#\" to a C char-literal comparison, both orders", () => {
+    const a = compileVaporApp("c.tsx", cmp("t.text[x.value] === \"#\""), "CMP", "gba");
+    expect(a.c).toMatch(/vp_sb_at\(&l_t_\d+->text, g_x\) == '#'/);
+    expect(a.c).not.toContain("== S");
+
+    const b = compileVaporApp("c.tsx", cmp("\"#\" === t.text[x.value]"), "CMP", "gba");
+    expect(b.c).toMatch(/'#' == vp_sb_at\(&l_t_\d+->text, g_x\)/);
+
+    const ne = compileVaporApp("c.tsx", cmp("ROW[x.value] !== \"#\""), "CMP", "gba");
+    expect(ne.c).toMatch(/vp_char_at\(S\d+, 2, g_x\) != '#'/);
+  });
+
+  test("strlit vs strlit keeps its existing pointer comparison", () => {
+    const source = `${HEADER}
+const A = "x";
+const B = "y";
+export default () => {
+  const n = ref(0);
+  onButton((b) => { if (A === B) n.value = 1; });
+  return (<><row y={0}>{n.value}</row></>);
+};
+`;
+    const app = compileVaporApp("c.tsx", source, "CMP", "gba");
+    expect(app.c).toMatch(/\(S\d+ == S\d+\)/);
+    expect(app.c).not.toContain("'x'");
+  });
+
+  for (const [expr] of [
+    ["t.text[x.value] === \"##\""],
+    ["\"##\" === ROW[x.value]"],
+    ["ROW[x.value] !== \"##\""],
+  ] as const) {
+    test(`rejects a char compared to a multi-char literal: ${expr}`, () => {
+      const msg = compileErr(cmp(expr));
+      expect(msg).toContain("comparing a char to a multi-character string");
+      expect(msg).toMatch(/^test\.tsx:\d+:\d+/);
+    });
+  }
+
+  test("rejects a char compared to an empty string literal", () => {
+    const msg = compileErr(cmp("t.text[x.value] === \"\""));
+    expect(msg).toContain("comparing a char to an empty string");
+  });
+
+  test("escapes quote and backslash literals as char constants", () => {
+    const quote = compileVaporApp("c.tsx", cmp("t.text[x.value] === \"'\""), "CMP", "gba");
+    expect(quote.c).toMatch(/vp_sb_at\(&l_t_\d+->text, g_x\) == '\\''/);
+    const slash = compileVaporApp("c.tsx", cmp("t.text[x.value] === \"\\\\\""), "CMP", "gba");
+    expect(slash.c).toMatch(/vp_sb_at\(&l_t_\d+->text, g_x\) == '\\\\'/);
+  });
+
+  // the actual D207 fork: gba-gcc accepts the bad C, sdcc (GB) and cc65
+  // (NES) reject it — build the small char-compare board through BOTH real
+  // toolchains.
+  const CHARBOARD = join(import.meta.dir, "fixtures", "charboard.tsx");
+  const sdcc = Bun.which("sdcc");
+  const cc65 = Bun.which("cc65");
+  (sdcc ? test : test.skip)("gb: sdcc builds char-vs-char-literal comparisons", async () => {
+    const { buildRom } = await import("../compiler/rom.ts");
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-d207-gb-"));
+    try {
+      const source = await Bun.file(CHARBOARD).text();
+      const app = compileVaporApp(CHARBOARD, source, "CHARBOARD", "gb");
+      const rom = join(dir, "charboard.gb");
+      const artifacts = await buildRom(app, "gb", rom);
+      expect(artifacts[0].bytes).toBeGreaterThan(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+  (cc65 ? test : test.skip)("nes: cc65 builds char-vs-char-literal comparisons", async () => {
+    const { buildRom } = await import("../compiler/rom.ts");
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-d207-nes-"));
+    try {
+      const source = await Bun.file(CHARBOARD).text();
+      const app = compileVaporApp(CHARBOARD, source, "CHARBOARD", "nes");
+      const rom = join(dir, "charboard.nes");
+      const artifacts = await buildRom(app, "nes", rom);
+      expect(artifacts[0].bytes).toBeGreaterThan(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 // Dead data/functions: nm + grep showed no runtime reads (fleet task 822,
 // scout task-764 §4.2). The cartridge title ships via JS-side header patches
 // (rom.ts); GBA reads palette banks directly; the console runtimes never call

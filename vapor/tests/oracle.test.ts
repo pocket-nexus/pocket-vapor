@@ -116,6 +116,46 @@ describe("vapor todo oracle", () => {
   });
 });
 
+// D207: the char-vs-one-char-literal board must behave the same under real
+// Vue Vapor — `"#" === "#"` there, a C char compare on device.
+const CHARBOARD_ENTRY = join(import.meta.dir, "fixtures", "charboard-entry.ts");
+const CHARBOARD_SRC = join(import.meta.dir, "fixtures", "charboard.tsx");
+const charboardStyles = compileVaporApp(
+  CHARBOARD_SRC,
+  await Bun.file(CHARBOARD_SRC).text(),
+  "CHARBOARD",
+  "gba",
+).styles;
+const bootCharboard = () =>
+  bootOracle({ width: 30, height: 20, styles: charboardStyles, entry: CHARBOARD_ENTRY });
+const crow = (o: Oracle, y: number): string => o.grid().chars[y].slice(0, 4);
+
+describe("char vs one-char literal oracle (D207)", () => {
+  test("walls block moves and only floor cells mark", async () => {
+    const o = await bootCharboard();
+    expect(crow(o, 0)).toBe("#..#");
+    expect(crow(o, 1)).toBe("1".padEnd(4));
+    expect(crow(o, 2)).toBe("0".padEnd(4));
+
+    await o.press(Button.Left); // blocked by the wall at 0
+    expect(crow(o, 1)).toBe("1".padEnd(4));
+    await o.press(Button.Right); // to 2
+    expect(crow(o, 1)).toBe("2".padEnd(4));
+    await o.press(Button.Right); // blocked by the wall at 3
+    expect(crow(o, 1)).toBe("2".padEnd(4));
+    await o.press(Button.A); // 2 is floor: mark
+    expect(crow(o, 2)).toBe("1".padEnd(4));
+    await o.press(Button.Left); // back to 1
+    await o.press(Button.A);
+    expect(crow(o, 2)).toBe("2".padEnd(4));
+    await o.press(Button.Left); // blocked
+    await o.press(Button.A); // 1 still floor: marks again
+    expect(crow(o, 1)).toBe("1".padEnd(4));
+    expect(crow(o, 2)).toBe("3".padEnd(4));
+    o.unmount();
+  });
+});
+
 // putChar is amphibious: this is the reference semantics the compiler's
 // vp_sb_put must reproduce cell-for-cell on device (see board parity test).
 describe("pooled string-row board oracle (vp_sb_at + putChar)", () => {
