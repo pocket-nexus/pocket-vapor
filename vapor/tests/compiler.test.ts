@@ -208,6 +208,204 @@ export default () => {
     expect(msg).toContain("annotated `: number`");
   });
 
+  test("pure number helpers compile to s32 functions usable in render and if", () => {
+    const source = `${HEADER}
+interface Cell { k: number }
+export default () => {
+  const cells = ref<Cell[]>([{ k: 1 }, { k: 2 }, { k: 3 }]);
+  const cur = ref(0);
+  function codeAt(i: number): number {
+    const c = cells.value[i];
+    if (c) return c.k;
+    return 0;
+  }
+  function score(): number {
+    return codeAt(0) + codeAt(1) + codeAt(2);
+  }
+  // boolean params are accepted and lower to s32 just like number params
+  function isWall(i: number, want: boolean): number {
+    if (want) return codeAt(i) * 2;
+    return codeAt(i);
+  }
+  onButton((b) => {
+    if (b === Button.A) {
+      const c = cells.value[cur.value];
+      if (c) c.k = c.k + 1;
+    } else if (b === Button.Right) cur.value = cur.value + 1;
+  });
+  return (
+    <>
+      <row y={0}>{"SCORE "}{score()}</row>
+      <row y={1}>{isWall(cur.value, cur.value === 0)}</row>
+    </>
+  );
+};
+`;
+    const app = compileVaporApp("test.tsx", source);
+    expect(app.c).toContain("static s32 fn_codeAt(s32 p_i) {");
+    expect(app.c).toContain("static s32 fn_score(void) {");
+    // result used as a render expression
+    expect(app.c).toMatch(/vp_ln_int\(fn_score\(\)\)/);
+    // result used in an if condition inside another helper
+    expect(app.c).toMatch(/if \(p_want\)/);
+    expect(app.c).toMatch(/fn_codeAt\(p_i\) \* 2/);
+    // bool params lower to s32 like number params
+    expect(app.c).toContain("static s32 fn_isWall(s32 p_i, s32 p_want)");
+  });
+
+  test("rejects number helpers that write a ref", () => {
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function bad(): number { count.value = 1; return count.value; }
+  onButton((b) => { count.value = bad(); });
+  return (<><row y={0}>{bad()}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("helpers that return a number must be pure");
+  });
+
+  test("rejects number helpers that write a record field", () => {
+    const source = `${HEADER}
+interface It { k: number }
+export default () => {
+  const items = ref<It[]>([{ k: 1 }]);
+  function bad(): number {
+    const t = items.value[0];
+    if (t) t.k = 2;
+    return 0;
+  }
+  onButton((b) => {});
+  return (<><row y={0}>{bad()}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("helpers that return a number must be pure");
+  });
+
+  test("rejects number helpers that push or splice a list", () => {
+    const head = `${HEADER}
+interface It { k: number }
+export default () => {
+  const items = ref<It[]>([{ k: 1 }]);`;
+    const tail = `onButton((b) => {});
+  return (<><row y={0}>{bad()}</row></>);
+};
+`;
+    const pushSrc = `${head}
+  function bad(): number { items.value.push({ k: 2 }); return items.value.length; }
+  ${tail}`;
+    expect(compileErr(pushSrc)).toContain("helpers that return a number must be pure");
+    const spliceSrc = `${head}
+  function bad(): number { const t = items.value[0]; if (t) items.value.splice(0, 1); return 0; }
+  ${tail}`;
+    expect(compileErr(spliceSrc)).toContain("helpers that return a number must be pure");
+  });
+
+  test("rejects impure helpers called transitively from a number helper", () => {
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function writer(): number { count.value = 1; return count.value; }
+  function reader(): number { return writer() + 1; }
+  onButton((b) => {});
+  return (<><row y={0}>{reader()}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("helpers that return a number must be pure");
+  });
+
+  test("rejects helper params that are not number or boolean", () => {
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function bad(s: string): number { return s.length; }
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("annotated `: number` or `: boolean`");
+  });
+
+  test("rejects non-number helper return annotations", () => {
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function bad(): boolean { return count.value === 0; }
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("helper return type must be `: number`");
+  });
+
+  test("rejects a number helper that never returns a value", () => {
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function bad(): number { count.value = count.value + 1; }
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("declares `: number` but never returns a value");
+  });
+
+  test("rejects value returns in the onButton handler and keymap arrows", () => {
+    const handlerSrc = `${HEADER}
+export default () => {
+  const count = ref(0);
+  onButton((b) => { return 1; });
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    expect(compileErr(handlerSrc)).toContain("cannot return values");
+    const kmSrc = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function f(): number { return 1; }
+  const keys = { [Button.A]: f };
+  onButton((b) => keys[b]?.());
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    expect(compileErr(kmSrc)).toContain("keymap");
+  });
+
+  test("rejects recursion through helper call cycles", () => {
+    const direct = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function f(n: number): number { return f(n - 1); }
+  onButton((b) => {});
+  return (<><row y={0}>{f(0)}</row></>);
+};
+`;
+    expect(compileErr(direct)).toContain("recursive");
+    const mutual = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function a(): void { b(); }
+  function b(): void { a(); }
+  onButton((b2) => { a(); });
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    expect(compileErr(mutual)).toContain("recursive");
+  });
+
+  test("rejects a number helper calling a void helper", () => {
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function side(): void { count.value = count.value + 1; }
+  function pure(): number { side(); return count.value; }
+  onButton((b) => {});
+  return (<><row y={0}>{pure()}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("void helper");
+  });
+
   test("components inline to zero-cost paint code", async () => {
     const source = await Bun.file(ENTRY).text();
     const app = compileVaporApp(ENTRY, source);

@@ -235,3 +235,57 @@ describe("per-pool capacity oracle (withCapacity is identity)", () => {
     o.unmount();
   });
 });
+
+// Number-returning pure helpers are ordinary TypeScript: under the real Vue
+// Vapor runtime they are just setup-scope closures. This pins the semantics
+// the AOT extension (compile.ts fn result type) must match cell-for-cell.
+const PURE_HELPER_FIXTURE = join(import.meta.dir, "fixtures", "pure-helper.tsx");
+const pureHelperStyles = compileVaporApp(
+  PURE_HELPER_FIXTURE,
+  await Bun.file(PURE_HELPER_FIXTURE).text(),
+  "PURE HELPER",
+  "gba",
+).styles;
+const bootPureHelper = () =>
+  bootOracle({
+    styles: pureHelperStyles,
+    entry: join(import.meta.dir, "..", "oracle", "entry-pure-helper.ts"),
+  });
+
+describe("pure number helper fixture under real Vue Vapor", () => {
+  const row0 = (o: Awaited<ReturnType<typeof bootPureHelper>>) => o.grid().chars[0];
+  const row1 = (o: Awaited<ReturnType<typeof bootPureHelper>>) => o.grid().chars[1];
+
+  test("helper reads render: score sums codeAt over the pool", async () => {
+    const o = await bootPureHelper();
+    expect(row0(o)).toBe("S 6".padEnd(30)); // 1+2+3
+    expect(row1(o)).toBe("I 0 V 1 T 6".padEnd(30));
+    await o.press(Button.Right);
+    expect(row1(o)).toBe("I 1 V 2 T 6".padEnd(30));
+    o.unmount();
+  });
+
+  test("score follows record writes seen through the pure helper", async () => {
+    const o = await bootPureHelper();
+    await o.press(Button.Right); // cursor 1
+    await o.press(Button.A); // cells[1].k 2 -> 3
+    expect(row1(o)).toBe("I 1 V 3 T 7".padEnd(30));
+    expect(row0(o)).toBe("S 7".padEnd(30)); // 1+3+3
+    await o.press(Button.Right); // cursor 2
+    expect(row1(o)).toBe("I 2 V 3 T 7".padEnd(30));
+    await o.press(Button.A); // cells[2].k 3 -> 4
+    expect(row1(o)).toBe("I 2 V 4 T 8".padEnd(30));
+    expect(row0(o)).toBe("S 8".padEnd(30)); // 1+3+4
+    o.unmount();
+  });
+
+  test("cursor clamps and helper reads stay consistent", async () => {
+    const o = await bootPureHelper();
+    await o.press(Button.Left); // clamped at 0
+    expect(row1(o)).toBe("I 0 V 1 T 6".padEnd(30));
+    await o.press(Button.A); // cells[0].k 1 -> 2
+    expect(row0(o)).toBe("S 7".padEnd(30)); // 2+2+3
+    expect(row1(o)).toBe("I 0 V 2 T 7".padEnd(30));
+    o.unmount();
+  });
+});
