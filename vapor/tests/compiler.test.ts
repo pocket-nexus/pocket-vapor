@@ -443,6 +443,20 @@ export default () => {
     expect(app.c).toMatch(/vp_max\(0, vp_min\(9, p_x\)\)/);
   });
 
+  test("rejects a number helper that only returns on some paths", () => {
+    // an if without an else can fall through; the emitted s32 function must
+    // never reach its end without returning
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function half(x: number): number { if (x > 0) { return x - 1; } }
+  onButton((b) => {});
+  return (<><row y={0}>{half(count.value)}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("can reach the end without returning a value");
+  });
+
   test("components inline to zero-cost paint code", async () => {
     const source = await Bun.file(ENTRY).text();
     const app = compileVaporApp(ENTRY, source);
