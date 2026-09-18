@@ -152,6 +152,14 @@ Enforced with diagnostics, not documentation. In:
   callable from actions, handlers, and each other.
 - **Const objects** (`const PAL = { title: 1, ... }`) fold at member
   access; const string/string[] fold `.length` and index.
+- **Record string fields index like ROM strings**: `line.text[i]` reads one
+  byte (`vp_sb_at`, space sentinel out of range). A single byte is edited in
+  place through the amphibious `putChar` host helper —
+  `line.text = putChar(line.text, i, ch)` (ch a string index or one-char
+  literal); under real Vue it rebuilds the immutable string, the compiler
+  lowers it to one bounded byte store plus `vp_mark` (out-of-range writes
+  trip `VP_TRIP_INDEX` and change nothing). Direct `line.text[i] = ch` is
+  rejected: it is a silent no-op under real Vue.
 - **Whole-list assignment**: `todos.value = todos.value.filter(...)` —
   views over one list always carry increasing pool indices, so the
   compiler emits an in-place compaction; new-array identity always

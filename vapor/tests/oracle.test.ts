@@ -19,6 +19,15 @@ function line(oracle: Awaited<ReturnType<typeof bootOracle>>, y: number): string
   return oracle.grid().chars[y];
 }
 
+// The pooled-string-row test board mounts through its own bundle entry; its
+// read (ln.text[i]) and in-place write (putChar) must behave under real Vue
+// exactly the way the compiled device behaves.
+const BOARD_ENTRY = join(import.meta.dir, "fixtures", "board-entry.ts");
+const BOARD_SRC = join(import.meta.dir, "fixtures", "board.tsx");
+const boardStyles = compileVaporApp(BOARD_SRC, await Bun.file(BOARD_SRC).text(), "BOARD", "gba").styles;
+const bootBoard = () => bootOracle({ width: 30, height: 20, styles: boardStyles, entry: BOARD_ENTRY });
+const brow = (o: Oracle, y: number): string => o.grid().chars[y].slice(0, 7);
+
 describe("vapor todo oracle", () => {
   test("boots with seed todos and computed header", async () => {
     const o = await boot();
@@ -103,6 +112,45 @@ describe("vapor todo oracle", () => {
     await o.press(Button.Down); // cursor on last
     await o.press(Button.B); // delete last -> cursor clamps to new last
     expect(line(o, 4)).toBe(" >[X] WRITE THE COMPILER".padEnd(30));
+    o.unmount();
+  });
+});
+
+// putChar is amphibious: this is the reference semantics the compiler's
+// vp_sb_put must reproduce cell-for-cell on device (see board parity test).
+describe("pooled string-row board oracle (vp_sb_at + putChar)", () => {
+  test("dynamic read reflects the byte, in-place write toggles a cell", async () => {
+    const o = await bootBoard();
+    expect(brow(o, 0)).toBe(".......");
+    expect(o.grid().chars[3].trim()).toBe("0,0");
+
+    await o.press(Button.A); // toggle (0,0) . -> $
+    expect(brow(o, 0)).toBe("$......");
+
+    await o.press(Button.Right);
+    await o.press(Button.A); // toggle (1,0) -> $
+    expect(brow(o, 0)).toBe("$$.....");
+    expect(o.grid().chars[3].trim()).toBe("1,0");
+
+    await o.press(Button.A); // toggle (1,0) back to .
+    expect(brow(o, 0)).toBe("$......");
+
+    await o.press(Button.Down);
+    await o.press(Button.Left);
+    await o.press(Button.A); // toggle (0,1) -> $
+    expect(brow(o, 0)).toBe("$......");
+    expect(brow(o, 1)).toBe("$......");
+    expect(o.grid().chars[3].trim()).toBe("0,1");
+    o.unmount();
+  });
+
+  test("a write past the string end is a no-op", async () => {
+    const o = await bootBoard();
+    await o.press(Button.A); // (0,0) -> $
+    await o.press(Button.Select); // badWrite index 9 >= 7
+    expect(brow(o, 0)).toBe("$......");
+    expect(brow(o, 1)).toBe(".......");
+    expect(brow(o, 2)).toBe(".......");
     o.unmount();
   });
 });

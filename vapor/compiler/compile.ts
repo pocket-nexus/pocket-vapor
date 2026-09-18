@@ -248,6 +248,7 @@ class AppCompiler {
   private hostOnButton = "";
   private hostButton = "";
   private hostOnAxisDelta = "";
+  private hostPutChar = "";
 
   // emission
   private decls: string[] = [];
@@ -477,6 +478,9 @@ class AppCompiler {
           name: local,
           value: { width: this.target.width, height: this.target.height },
         });
+      } else if (/\/host\/text(\.ts)?$/.test(from)) {
+        if (imported === "putChar") this.hostPutChar = local;
+        else this.err(spec, `unsupported host import: ${imported}`);
       } else this.err(stmt, `unsupported import source: ${from}`);
     }
   }
@@ -825,6 +829,13 @@ class AppCompiler {
 
   private escC(text: string): string {
     return text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  }
+
+  /** A single-char JS string literal as a C char literal, e.g. "#" -> '#'. */
+  private cCharLit(ch: string): string {
+    if (ch === "'") return "'\\''";
+    if (ch === "\\") return "'\\\\'";
+    return `'${ch}'`;
   }
 
   private depRef(name: string): void {
@@ -1691,7 +1702,13 @@ class AppCompiler {
       const iface = this.ifaces.get(obj.ty.iface)!;
       const field = iface.fields.find((f) => f.name === lhs.name.text);
       if (!field) this.err(lhs, `no field ${lhs.name.text} on ${obj.ty.iface}`);
-      if (field.ty === "str") this.err(lhs, "string field writes only via push");
+      if (field.ty === "str") {
+        if (this.compilePutCharField(lhs, obj.c, obj.ty.listRef, rhs, out, ind)) return;
+        this.err(
+          lhs,
+          "string field writes only via push, or `t.s = putChar(t.s, i, ch)` for one byte",
+        );
+      }
       const v = this.compileExpr(rhs, out, ind);
       const tmp = this.tmp("fv");
       const cast = field.ty === "bool" ? "(u8)" : "(s32)";
@@ -1700,7 +1717,68 @@ class AppCompiler {
       );
       return;
     }
+    // line.text[i] = c: a silent no-op under real Vue (strings are immutable);
+    // the subset spells it `line.text = putChar(line.text, i, c)`.
+    if (ts.isElementAccessExpression(lhs)) {
+      this.err(lhs, "indexed string assignment is a no-op in Vue; use `t.s = putChar(t.s, i, ch)`");
+    }
     this.err(lhs, "unsupported assignment target");
+  }
+
+  /**
+   * Recognize `t.f = putChar(t.f, i, ch)` and lower it to one in-place byte
+   * store. The first argument must name the same record string field as the
+   * assignment target (the oracle rebuilds that exact string); `ch` must be
+   * a single char — a const-string/record-string index or a one-char literal.
+   * Returns true when the intrinsic was compiled.
+   */
+  private compilePutCharField(
+    lhs: ts.PropertyAccessExpression,
+    recC: string,
+    listRef: string,
+    rhs: ts.Expression,
+    out: string[],
+    ind: string,
+  ): boolean {
+    rhs = this.unparen(rhs);
+    if (!ts.isCallExpression(rhs)) return false;
+    const callee = this.unparen(rhs.expression);
+    if (!ts.isIdentifier(callee) || callee.text !== this.hostPutChar || !this.hostPutChar) return false;
+    const [target, idxNode, chNode] = rhs.arguments;
+    if (rhs.arguments.length !== 3 || !target || !idxNode || !chNode)
+      this.err(rhs, "putChar takes exactly (text, index, char)");
+
+    // arg0 must be the same field access as the assignment target
+    const ta = this.unparen(target);
+    if (
+      !ts.isPropertyAccessExpression(ta) ||
+      ta.name.text !== lhs.name.text ||
+      ta.expression.getText(this.sf) !== lhs.expression.getText(this.sf)
+    ) {
+      this.err(
+        target,
+        `putChar must edit the assigned field: write \`${lhs.getText(this.sf)} = putChar(${lhs.getText(this.sf)}, i, ch)\``,
+      );
+    }
+
+    const idx = this.compileExpr(idxNode, out, ind);
+    if (idx.ty.k !== "num") this.err(idxNode, "putChar index must be a number");
+
+    let ch: { c: string; ty: Ty };
+    if (ts.isStringLiteral(chNode)) {
+      if (chNode.text.length !== 1)
+        this.err(chNode, `putChar char must be one character, got a ${chNode.text.length}-char literal`);
+      ch = { c: this.cCharLit(chNode.text), ty: { k: "char" } };
+    } else {
+      ch = this.compileExpr(chNode, out, ind);
+      if (ch.ty.k !== "char")
+        this.err(chNode, "putChar char must be a single char (a string index or a one-char literal)");
+    }
+
+    out.push(
+      `${ind}if (vp_sb_put(&${recC}->${lhs.name.text}, ${idx.c}, ${ch.c})) ${this.markCode(listRef)};`,
+    );
+    return true;
   }
 
   private compilePush(listExpr: ts.Expression, call: ts.CallExpression, out: string[], ind: string): void {
@@ -2288,6 +2366,12 @@ class AppCompiler {
     c.push("static inline char VP_UNUSED_FN vp_char_at(const char *s, s32 n, s32 i) { return (i >= 0 && i < n) ? s[i] : ' '; }");
     c.push(
       "static inline char VP_UNUSED_FN vp_sb_at(const vp_sb *s, s32 i) { return (i >= 0 && i < (s32)s->len) ? s->b[i] : ' '; }",
+    );
+    // putChar intrinsic. Out-of-range indices trip VP_TRIP_INDEX and leave
+    // the string untouched; returns changed, gating the caller's vp_mark.
+    // The `!=` guard (not an equality early return) avoids a cc65 2.18 -O crash.
+    c.push(
+      "static inline u8 VP_UNUSED_FN vp_sb_put(vp_sb *s, s32 i, char c) { if (i < 0 || i >= (s32)s->len) { vp_tripwires |= VP_TRIP_INDEX; return 0; } if (s->b[i] != c) { s->b[i] = c; return 1; } return 0; }",
     );
     c.push("");
 

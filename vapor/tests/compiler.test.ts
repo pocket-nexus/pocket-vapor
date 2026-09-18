@@ -348,6 +348,140 @@ export default () => {
   });
 });
 
+// In-place one-byte writes go through the amphibious putChar host helper:
+// under real Vue it rebuilds an immutable string, the compiler lowers the
+// exact `t.s = putChar(t.s, i, ch)` shape to one in-place vp_sb_put + mark.
+describe("record string field in-place write (putChar)", () => {
+  const WRITE = `${HEADER}
+import { putChar } from "../../host/text.ts";
+const CH = "#$";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  const x = ref(0);
+  onButton((b) => {
+    if (b === Button.Right) x.value = 2;
+    if (b === Button.A) {
+      const t = rows.value[0];
+      if (t) t.text = putChar(t.text, x.value, CH[1]);
+    }
+  });
+  return (<>{rows.value.map((rr, i) => <row y={i}>{rr.text}</row>)}</>);
+};
+`;
+
+  test("lowers to vp_sb_put + vp_mark with no slice rebuild or overlay temp", () => {
+    const app = compileVaporApp("write.tsx", WRITE, "WRITE", "gba");
+    expect(app.c).toMatch(
+      /if \(vp_sb_put\(&l_t_\d+->text, g_x, vp_char_at\(S\d+, 2, 1\)\)\) vp_mark\(0\);/,
+    );
+    // one in-place byte store, not the slice+ch+slice string-builder path
+    expect(app.c).not.toContain("vp_sb_slice");
+    expect(app.c).not.toMatch(/ovl_sb/);
+  });
+
+  test("accepts a one-character literal as the char", () => {
+    const source = `${HEADER}
+import { putChar } from "../../host/text.ts";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.text = putChar(t.text, 1, "Z");
+  });
+  return (<>{rows.value.map((rr, i) => <row y={i}>{rr.text}</row>)}</>);
+};
+`;
+    const app = compileVaporApp("write.tsx", source, "WRITE", "gba");
+    expect(app.c).toMatch(/vp_sb_put\(&l_t_\d+->text, 1, 'Z'\)/);
+  });
+
+  test("rejects a multi-char literal as the char", () => {
+    const source = `${HEADER}
+import { putChar } from "../../host/text.ts";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.text = putChar(t.text, 1, "XY");
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const msg = compileErr(source);
+    expect(msg).toContain("putChar char must be one character");
+  });
+
+  test("rejects a non-char (number) as the char", () => {
+    const source = `${HEADER}
+import { putChar } from "../../host/text.ts";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  const n = ref(0);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.text = putChar(t.text, 1, n.value);
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const msg = compileErr(source);
+    expect(msg).toContain("putChar char must be a single char");
+  });
+
+  test("rejects putChar editing a field other than the assigned one", () => {
+    const source = `${HEADER}
+import { putChar } from "../../host/text.ts";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.text = putChar("xyz", 1, "Z");
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const msg = compileErr(source);
+    expect(msg).toContain("putChar must edit the assigned field");
+  });
+
+  test("rejects direct indexed string assignment (a Vue no-op)", () => {
+    const source = `${HEADER}
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.text[1] = "Z";
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const msg = compileErr(source);
+    expect(msg).toContain("indexed string assignment is a no-op in Vue");
+  });
+
+  test("plain string-field assignment still says use push/putChar", () => {
+    const source = `${HEADER}
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.text = "zzz";
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const msg = compileErr(source);
+    expect(msg).toContain("string field writes only via push");
+  });
+});
+
 // Dead data/functions: nm + grep showed no runtime reads (fleet task 822,
 // scout task-764 §4.2). The cartridge title ships via JS-side header patches
 // (rom.ts); GBA reads palette banks directly; the console runtimes never call

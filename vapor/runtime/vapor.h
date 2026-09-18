@@ -88,6 +88,8 @@ u8 vp_sb_eq(const vp_sb *a, const vp_sb *b);
 #define VP_TRIP_STR_TRUNC 2
 #define VP_TRIP_VIEW_FULL 4
 #define VP_TRIP_PLATFORM_RENDER 8
+/* putChar into an out-of-range record string index: no byte is written. */
+#define VP_TRIP_INDEX 16
 extern u8 vp_tripwires;
 
 /* core state shared with the per-target runtime */
