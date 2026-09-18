@@ -18,6 +18,14 @@
 // unchanged on both sides.
 //
 // ASCII only, like the rest of the string subset.
+//
+// Out-of-range READS are a different matter and are NOT shared semantics:
+// `line.text[i]` (the record-field index) compiles to vp_sb_at, which
+// returns the space sentinel ' ' when i < 0 || i >= len, whereas real Vue
+// returns undefined and interpolates nothing. No tripwire fires for such a
+// read, so apps must guard before classifying a cell by its byte
+// (`i < line.text.length ? line.text[i] : CH[empty]`) rather than rely on
+// the device's space. See DESIGN.md §4 "Out-of-range reads diverge".
 
 /**
  * Return `s` with the character at `i` replaced by `ch`. Returns `s`

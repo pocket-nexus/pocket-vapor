@@ -160,6 +160,16 @@ Enforced with diagnostics, not documentation. In:
   lowers it to one bounded byte store plus `vp_mark` (out-of-range writes
   trip `VP_TRIP_INDEX` and change nothing). Direct `line.text[i] = ch` is
   rejected: it is a silent no-op under real Vue.
+  - **Out-of-range reads diverge from real Vue and must not be relied on.**
+    With `i < 0 || i >= line.text.length`, the device returns the space
+    sentinel `' '`, while real Vue returns `undefined`; interpolating it
+    renders one space on device and nothing in the oracle. No tripwire
+    fires for such reads (only out-of-range *writes* trip). Code that
+    classifies cells by comparing against a space — e.g. reading level text
+    past a row's end — therefore takes different branches on the two sides.
+    Treat an out-of-range index as outside the subset and guard it at the
+    call site: `x < line.text.length ? line.text[x] : CH[empty]`. The
+    Sokoban board never depends on the space sentinel.
 - **Whole-list assignment**: `todos.value = todos.value.filter(...)` —
   views over one list always carry increasing pool indices, so the
   compiler emits an in-place compaction; new-array identity always
