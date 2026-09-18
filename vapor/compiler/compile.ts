@@ -102,7 +102,7 @@ type Ty =
   | { k: "strlit" } // C `const char *`
   | { k: "sb" } // C `const vp_sb *`
   | { k: "obj"; iface: string; listRef: string } // nullable record pointer
-  | { k: "view"; iface: string; listRef: string; maxLen: number }
+  | { k: "view"; iface: string; listRef: string; maxLen: number; cap: number }
   | { k: "void" };
 
 const NUM: Ty = { k: "num" };
@@ -120,6 +120,10 @@ interface RefBinding {
   refTy: "num" | "bool" | "str" | "list";
   iface?: string;
   seed: ts.Expression;
+  /** Static element capacity for a list pool. Defaults to the target's
+   * poolCap when the seed is not wrapped in withCapacity(); a declared
+   * capacity sizes only THIS pool (and the views derived from it). */
+  cap?: number;
 }
 
 interface ComputedBinding {
@@ -249,6 +253,7 @@ class AppCompiler {
   private hostButton = "";
   private hostOnAxisDelta = "";
   private hostPutChar = "";
+  private hostWithCapacity = "";
 
   // emission
   private decls: string[] = [];
@@ -279,7 +284,7 @@ class AppCompiler {
   // computed accessors, keymap actions). The subset forbids recursion and
   // nothing runs from interrupts, so reachability is the whole story.
   // Placeholders are substituted with colored slot names at emit time.
-  private ovlTemps: { id: number; kind: "view" | "sb"; owner: string }[] = [];
+  private ovlTemps: { id: number; kind: "view" | "sb"; owner: string; cap: number }[] = [];
   private ovlEdges = new Map<string, Set<string>>(); // caller -> callees
   private ovlOwnerStack: string[] = [];
   private unitCounter = 0;
@@ -297,9 +302,11 @@ class AppCompiler {
     }
   }
 
-  private allocTemp(kind: "view" | "sb"): string {
+  /** View temps carry the capacity of the list their indices index, so a
+   * small list's temp need not reserve the global VP_VIEW_CAP. */
+  private allocTemp(kind: "view" | "sb", cap = this.target.poolCap): string {
     const id = this.ovlTemps.length;
-    this.ovlTemps.push({ id, kind, owner: this.ovlOwner() });
+    this.ovlTemps.push({ id, kind, owner: this.ovlOwner(), cap });
     return `@OVL${id}@`;
   }
 
@@ -377,20 +384,42 @@ class AppCompiler {
     let slotBytes = 0;
     for (const kind of ["view", "sb"] as const) {
       const temps = this.ovlTemps.filter((t) => t.kind === kind);
-      const slots: { name: string; members: { owner: string }[] }[] = [];
+      // Assign temps to non-interfering slots; each slot's declaration is as
+      // wide as the largest cap among its members (only relevant for views).
+      const slots: { name: string; members: { owner: string; cap: number }[]; cap: number }[] = [];
       for (const t of temps) {
         let slot = slots.find((s) => s.members.every((m) => !interferes(t, m)));
         if (!slot) {
-          slot = { name: `ovl_${kind}${slots.length}`, members: [] };
+          slot = { name: `ovl_${kind}${slots.length}`, members: [], cap: t.cap };
           slots.push(slot);
-          decls.push(`static ${kind === "view" ? "vp_view" : "vp_sb"} ${slot.name};`);
-          slotBytes += kind === "view" ? 1 + this.target.poolCap : 1 + this.target.strCap;
         }
+        if (t.cap > slot.cap) slot.cap = t.cap;
         slot.members.push(t);
         names.set(t.id, slot.name);
       }
+      for (const slot of slots) {
+        decls.push(`static ${kind === "view" ? this.viewTypeName(slot.cap) : "vp_sb"} ${slot.name};`);
+        slotBytes += kind === "view" ? 1 + slot.cap : 1 + this.target.strCap;
+      }
     }
     return { decls, names, slotBytes };
+  }
+
+  /** C type for a view index array of the given capacity. The target's
+   * default keeps the runtime's `vp_view` typedef (so unannotated apps emit
+   * byte-identical C); a declared capacity gets a local vp_view<cap>. */
+  private viewTypeName(cap: number): string {
+    return cap === this.target.poolCap ? "vp_view" : `vp_view${cap}`;
+  }
+
+  /** Distinct non-default view capacities actually used (overlay temps +
+   * computed views), so the matching local typedefs are emitted once. */
+  private allViewCaps(): number[] {
+    const caps = new Set<number>();
+    for (const t of this.ovlTemps) if (t.kind === "view") caps.add(t.cap);
+    for (const comp of this.computeds) if (comp.valTy.k === "view") caps.add(comp.valTy.cap);
+    caps.delete(this.target.poolCap);
+    return [...caps].sort((a, b) => a - b);
   }
 
   constructor(
@@ -480,6 +509,9 @@ class AppCompiler {
         });
       } else if (/\/host\/text(\.ts)?$/.test(from)) {
         if (imported === "putChar") this.hostPutChar = local;
+        else this.err(spec, `unsupported host import: ${imported}`);
+      } else if (/\/host\/list(\.ts)?$/.test(from)) {
+        if (imported === "withCapacity") this.hostWithCapacity = local;
         else this.err(spec, `unsupported host import: ${imported}`);
       } else this.err(stmt, `unsupported import source: ${from}`);
     }
@@ -600,16 +632,45 @@ class AppCompiler {
       const name = decl.name.text;
       const init = decl.initializer;
       if (ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === this.vueRef) {
-        const seed = init.arguments[0];
+        let seed = init.arguments[0];
+        let declaredCap: number | undefined;
         if (!seed) this.err(init, "ref() needs an initial value");
+        // withCapacity(seedArray, n): amphibious static pool-cap annotation
+        // (host/list.ts). The wrapper is erased; only the inner array seeds
+        // the list and n sizes its backing C array.
+        const capCall = this.unparen(seed);
+        if (
+          ts.isCallExpression(capCall) &&
+          ts.isIdentifier(capCall.expression) &&
+          capCall.expression.text === this.hostWithCapacity &&
+          this.hostWithCapacity
+        ) {
+          if (capCall.arguments.length !== 2)
+            this.err(capCall, "withCapacity takes exactly (seedArray, capacity)");
+          seed = capCall.arguments[0];
+          const capNode = capCall.arguments[1];
+          const capVal = this.constNum(capNode);
+          if (capVal === null || !Number.isInteger(capVal) || capVal < 1)
+            this.err(capNode, "withCapacity capacity must be a positive compile-time integer");
+          if (capVal > 255) this.err(capNode, "withCapacity capacity must fit in u8 (max 255)");
+          declaredCap = capVal;
+          if (!ts.isArrayLiteralExpression(this.unparen(seed)))
+            this.err(capCall, "withCapacity only annotates list refs ref<T[]>([...])");
+        }
         const binding: RefBinding = {
           kind: "ref",
           name,
           index: this.refs.length,
           refTy: this.classifyRefSeed(init, seed),
           seed,
+          cap: declaredCap,
         };
-        if (binding.refTy === "list") binding.iface = this.listIfaceOf(init, seed);
+        if (binding.refTy === "list") {
+          binding.iface = this.listIfaceOf(init, seed);
+          const seedLen = (seed as ts.ArrayLiteralExpression).elements.length;
+          if (declaredCap !== undefined && declaredCap < seedLen)
+            this.err(capCall, `withCapacity capacity ${declaredCap} is smaller than the ${seedLen}-element seed`);
+        }
         if (this.refs.length >= 16) this.err(init, "subset budget: at most 16 refs");
         this.refs.push(binding);
         this.scope.set(name, binding);
@@ -869,8 +930,15 @@ class AppCompiler {
     let binding!: ComputedBinding;
     const hoisted = this.withOwner(`c_${name}_update`, () => this.withHoist((lines) => {
     if (this.isViewExpr(body)) {
-      const maxLen = this.viewMaxLen(body);
-      binding = { kind: "computed", name, index, valTy: this.viewTyOf(body), deps, maxLen };
+      const valTy = this.viewTyOf(body);
+      binding = {
+        kind: "computed",
+        name,
+        index,
+        valTy,
+        deps,
+        maxLen: valTy.k === "view" ? valTy.maxLen : 0,
+      };
       this.compileViewInto(body, `c_${name}_v`, lines, "  ");
     } else {
       const val = this.compileExpr(body, lines, "  ");
@@ -890,9 +958,11 @@ class AppCompiler {
     const lines = [...hoisted.decls, ...hoisted.body];
     this.curDeps = prevDeps;
 
+    const viewCName =
+      binding.valTy.k === "view" ? this.viewTypeName(binding.valTy.cap) : "vp_view";
     const cTy =
       binding.valTy.k === "view"
-        ? { store: "static vp_view", accessor: "static const vp_view *", result: `&c_${name}_v` }
+        ? { store: `static ${viewCName}`, accessor: `static const ${viewCName} *`, result: `&c_${name}_v` }
         : binding.valTy.k === "obj"
           ? {
               store: `static rec_${binding.valTy.iface.toLowerCase()} *`,
@@ -946,7 +1016,29 @@ class AppCompiler {
 
   private viewTyOf(e: ts.Expression): Ty {
     const iface = this.viewIface(e);
-    return { k: "view", iface, listRef: this.viewListRef(e), maxLen: this.viewMaxLen(e) };
+    const listRef = this.viewListRef(e);
+    const cap = this.viewCap(e);
+    return { k: "view", iface, listRef, maxLen: Math.min(this.viewMaxLen(e), cap), cap };
+  }
+
+  /** Storage capacity a view must reserve: the largest source-list cap the
+   * expression can read. filter/slice never grow, so they inherit; a
+   * ternary of two lists takes the max of its arms. */
+  private viewCap(e: ts.Expression): number {
+    e = this.unparen(e);
+    if (ts.isConditionalExpression(e))
+      return Math.max(this.viewCap(e.whenTrue), this.viewCap(e.whenFalse));
+    if (ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression)) {
+      const method = e.expression.name.text;
+      if (method === "filter" || method === "slice") return this.viewCap(e.expression.expression);
+    }
+    const base = this.valueBase(e);
+    if (base) {
+      const b = this.scope.get(base);
+      if (b?.kind === "ref") return this.listCap(b.name);
+      if (b?.kind === "computed" && b.valTy.k === "view") return b.valTy.cap;
+    }
+    return this.target.poolCap;
   }
 
   private viewIface(e: ts.Expression): string {
@@ -973,6 +1065,13 @@ class AppCompiler {
     this.err(e, "cannot resolve the list this view reads");
   }
 
+  /** Static element capacity of one list pool: its declared withCapacity
+   * value, else the target default. Views are sized to this. */
+  private listCap(refName: string): number {
+    const b = this.scope.get(refName);
+    return b?.kind === "ref" ? (b.cap ?? this.target.poolCap) : this.target.poolCap;
+  }
+
   private viewMaxLen(e: ts.Expression): number {
     e = this.unparen(e);
     if (ts.isConditionalExpression(e)) {
@@ -991,7 +1090,7 @@ class AppCompiler {
     const base = this.valueBase(e);
     if (base) {
       const b = this.scope.get(base);
-      if (b?.kind === "ref") return this.target.poolCap;
+      if (b?.kind === "ref") return this.listCap(b.name);
       if (b?.kind === "computed") return b.maxLen;
     }
     return this.target.poolCap;
@@ -1181,17 +1280,19 @@ class AppCompiler {
         return { len: `g_${b.name}_len`, at: (i) => i };
       }
       if (b?.kind === "computed" && b.valTy.k === "view") {
+        const vty = b.valTy;
         for (const d of b.deps) this.depRef(d);
         this.ovlCall(`c_${b.name}_update`);
         const v = this.tmp("v");
-        this.declare(`const vp_view *${v};`);
+        this.declare(`const ${this.viewTypeName(vty.cap)} *${v};`);
         out.push(`${ind}${v} = c_${b.name}();`);
         return { len: `${v}->len`, at: (i) => `${v}->idx[${i}]` };
       }
     }
     // nested filter/slice chain: materialize into an overlay temp view
     if (ts.isCallExpression(e)) {
-      const v = this.allocTemp("view");
+      const ty = this.viewTyOf(e);
+      const v = this.allocTemp("view", ty.k === "view" ? ty.cap : this.target.poolCap);
       this.compileViewInto(e, v, out, ind);
       return { len: `${v}.len`, at: (i) => `${v}.idx[${i}]` };
     }
@@ -1683,7 +1784,7 @@ class AppCompiler {
           this.err(rhs, "list refs can only be assigned a filter/slice view");
         if (this.viewListRef(this.unparen(rhs)) !== b.name)
           this.err(rhs, "list assignment must derive from the same list");
-        const nv = this.allocTemp("view");
+        const nv = this.allocTemp("view", this.listCap(b.name));
         const k = this.tmp("k");
         out.push(`${ind}{ u8 ${k};`);
         this.compileViewInto(this.unparen(rhs), nv, out, ind + "  ");
@@ -1788,7 +1889,7 @@ class AppCompiler {
     const arg = call.arguments[0];
     if (!arg || !ts.isObjectLiteralExpression(arg)) this.err(call, "push takes an object literal");
     const iface = this.ifaces.get(b.iface!)!;
-    out.push(`${ind}if (g_${listRef}_len < ${this.target.poolCap}) {`);
+    out.push(`${ind}if (g_${listRef}_len < ${this.listCap(listRef)}) {`);
     out.push(`${ind}  rec_${iface.name.toLowerCase()} *np = g_${listRef} + (u16)(g_${listRef}_len++);`);
     for (const propNode of arg.properties) {
       if (!ts.isPropertyAssignment(propNode) || !ts.isIdentifier(propNode.name))
@@ -2284,7 +2385,8 @@ class AppCompiler {
       } else {
         const arr = ref.seed as ts.ArrayLiteralExpression;
         const iface = this.ifaces.get(ref.iface!)!;
-        if (arr.elements.length > this.target.poolCap) this.err(arr, `seed exceeds pool capacity ${this.target.poolCap}`);
+        const cap = this.listCap(ref.name);
+        if (arr.elements.length > cap) this.err(arr, `seed exceeds pool capacity ${cap}`);
         initOut.push(`  g_${ref.name}_len = ${arr.elements.length};`);
         arr.elements.forEach((el, i) => {
           if (!ts.isObjectLiteralExpression(el)) this.err(el, "list seeds are object literals");
@@ -2382,6 +2484,10 @@ class AppCompiler {
         .join(" ");
       c.push(`typedef struct { ${fields} } rec_${iface.name.toLowerCase()};`);
     }
+    // Per-list view types: a declared withCapacity cap narrows (or widens)
+    // the idx[] array vs the runtime's default-capped vp_view.
+    for (const cap of this.allViewCaps())
+      c.push(`typedef struct { u8 len; u8 idx[${cap}]; } ${this.viewTypeName(cap)};`);
     c.push("");
 
     // state
@@ -2389,7 +2495,7 @@ class AppCompiler {
       if (ref.refTy === "num") c.push(`static s32 g_${ref.name};`);
       else if (ref.refTy === "bool") c.push(`static s32 g_${ref.name};`);
       else if (ref.refTy === "str") c.push(`static vp_sb g_${ref.name};`);
-      else c.push(`static rec_${ref.iface!.toLowerCase()} g_${ref.name}[${this.target.poolCap}]; static u8 g_${ref.name}_len;`);
+      else c.push(`static rec_${ref.iface!.toLowerCase()} g_${ref.name}[${this.listCap(ref.name)}]; static u8 g_${ref.name}_len;`);
     }
     c.push("static u32 vp_dirty; static u32 c_valid;");
     c.push(`static const u32 C_INVAL[${Math.max(1, cInval.length)}] = { ${cInval.map((m) => `0x${m.toString(16)}u`).join(", ") || "0"} };`);
@@ -2519,10 +2625,12 @@ class AppCompiler {
     const pools = this.refs.filter((r) => r.refTy === "list");
     const poolBytes = pools.reduce((acc, p) => {
       const iface = this.ifaces.get(p.iface!)!;
-      return acc + this.recordStride(iface) * this.target.poolCap + 1;
+      return acc + this.recordStride(iface) * this.listCap(p.name) + 1;
     }, 0);
-    const viewBytes =
-      this.computeds.filter((comp) => comp.valTy.k === "view").length * (this.target.poolCap + 1);
+    const viewBytes = this.computeds.reduce(
+      (a, comp) => (comp.valTy.k === "view" ? a + 1 + comp.valTy.cap : a),
+      0,
+    );
     const scalarBytes = this.refs
       .filter((r) => r.refTy !== "list")
       .reduce((a, r) => a + (r.refTy === "str" ? this.target.strCap + 1 : 4), 0);

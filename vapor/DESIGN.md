@@ -164,6 +164,18 @@ Enforced with diagnostics, not documentation. In:
   views over one list always carry increasing pool indices, so the
   compiler emits an in-place compaction; new-array identity always
   triggers, matching Vue.
+- **Per-list static capacity**: every `ref<T[]>([...])` backs onto a
+  fixed-size pool. Unannotated, a list gets the target default (`poolCap`:
+  8 on NES, 32 on GBA/GB/ESP32/Playdate). A list that must grow past that —
+  a 12-row board, a 64-deep undo stack on NES — declares its own capacity
+  with the amphibious `withCapacity(seed, n)` host helper
+  (`ref<T[]>(withCapacity([...], 64))`). Under real Vue it is the identity
+  (the JS array is unbounded and the number is ignored); the compiler
+  declares that pool's C array with `n` records, compares the push guard
+  against `n`, and sizes every view derived from the list to `n`. Capacity
+  is per list (small pools stay small), must be a positive u8 compile-time
+  integer at least as large as the seed, and pushing past `n` still trips
+  `VP_TRIP_POOL_FULL` rather than overrunning.
 - Sugar: `+=`-family compound assignment (numbers and strings), `++`/`--`
   statements, negative `slice` ends.
 - Component = `setup()` returning a JSX render closure. One root component
