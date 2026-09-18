@@ -149,7 +149,19 @@ Enforced with diagnostics, not documentation. In:
   is the null check).
 - **Setup helpers with parameters**: `function moveCursor(d: number)` —
   compiled to real C functions with `s32` params (annotation required);
-  callable from actions, handlers, and each other.
+  callable from actions, handlers, and each other. A helper annotated
+  `: number` (e.g. `function cellAt(x: number, y: number): number`) is a
+  **pure function**: it compiles to `static s32 fn_cellAt(s32, s32)` and the
+  call site is an expression usable in arithmetic, `if` conditions, JSX
+  interpolations, computeds, and other helpers. Purity is enforced, not
+  assumed — the body may read refs/records and call other number helpers,
+  but any `.value`/field write, `++`/`--` on a ref, or `push`/`splice` is a
+  compile error ("helpers that return a number must be pure"), and a number
+  helper cannot call a void helper. Parameters are `: number` or `: boolean`
+  (both lower to `s32`; bool just documents a 0/1 argument); every path must
+  return. This keeps the helper out of the reactive graph — it marks nothing
+  and owns no dirty bit, so callers' dependency masks stay exact. Void
+  helpers and `onButton`/keymap actions still cannot return a value.
 - **Const objects** (`const PAL = { title: 1, ... }`) fold at member
   access; const string/string[] fold `.length` and index.
 - **Record string fields index like ROM strings**: `line.text[i]` reads one
@@ -204,7 +216,8 @@ Enforced with diagnostics, not documentation. In:
   `/` results are a compile error unless annotated — the demo needs none.
 
 Out (compile errors): closures escaping setup, dynamic property access,
-`any`, exceptions, async, classes, prototype anything, recursion in render,
+`any`, exceptions, async, classes, prototype anything, recursion in render
+or among setup helpers (the static call graph must be acyclic),
 `reactive()` deep proxies (v1 is `ref`-first; `reactive` is sugar the
 compiler can add later).
 

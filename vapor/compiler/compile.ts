@@ -141,7 +141,16 @@ interface FnBinding {
   decl: ts.FunctionDeclaration;
   emitted: boolean;
   deps: Set<string>;
-  params: string[]; // s32 params, annotated `: number` in source
+  params: string[]; // annotated `: number` / `: boolean` in source
+  paramTys: ("num" | "bool")[];
+  /** void helpers are side-effecting C functions; num helpers are pure and
+   * compile to an s32 expression at the call site. */
+  result: "void" | "num";
+  /** setup-helper calls appearing in the body (static call graph) */
+  callees: { name: string; node: ts.CallExpression }[];
+  /** first mutating statement in the body: ref/field write, ++/--, push, splice */
+  writeNode: ts.Node | null;
+  hasValueReturn: boolean;
 }
 
 interface ConstBinding {
@@ -260,6 +269,8 @@ class AppCompiler {
   private bodies: string[] = [];
   private tmpCounter = 0;
   private curDeps: Set<string> | null = null;
+  /** "num" while emitting a `: number` helper body: return must carry a value */
+  private curFnResult: "void" | "num" = "void";
   private strLits = new Map<string, string>(); // literal -> C name
   private strArrays = new Map<string, string>();
   // vp_sb_at/vp_sb_put are emitted only when the app actually lowers a record
@@ -576,12 +587,67 @@ class AppCompiler {
       if (ts.isVariableStatement(stmt)) this.scanSetupConst(stmt);
       else if (ts.isFunctionDeclaration(stmt)) {
         if (!stmt.name || !stmt.body) this.err(stmt, "setup functions need a name and body");
-        const params = stmt.parameters.map((p) => {
+        const params: string[] = [];
+        const paramTys: ("num" | "bool")[] = [];
+        for (const p of stmt.parameters) {
           if (!ts.isIdentifier(p.name)) this.err(p, "helper params must be simple names");
-          if (!p.type || p.type.getText(this.sf) !== "number")
-            this.err(p, "helper params must be annotated `: number`");
-          return p.name.text;
-        });
+          const tyText = p.type?.getText(this.sf);
+          if (tyText !== "number" && tyText !== "boolean")
+            this.err(p, "helper params must be annotated `: number` or `: boolean`");
+          params.push(p.name.text);
+          paramTys.push(tyText === "boolean" ? "bool" : "num");
+        }
+        // an explicit `: number` makes the helper a pure s32-returning
+        // function; no annotation (or explicit `: void`) keeps the void
+        // statement helper.
+        let result: FnBinding["result"] = "void";
+        const retTyText = stmt.type?.getText(this.sf);
+        if (retTyText !== undefined && retTyText !== "void") {
+          if (retTyText !== "number") this.err(stmt.type!, "helper return type must be `: number` (or omitted)");
+          result = "num";
+        }
+        const callees: FnBinding["callees"] = [];
+        let writeNode: ts.Node | null = null;
+        let hasValueReturn = false;
+        /** The subset's only assignment targets are `x.value` and record
+         * fields (compileAssign rejects bare locals). So a property-access
+         * LHS is exactly the reactive-write set. */
+        const unwrapParen = (e: ts.Expression): ts.Expression => {
+          while (ts.isParenthesizedExpression(e)) e = e.expression;
+          return e;
+        };
+        const noteWrite = (n: ts.Node): void => {
+          writeNode ??= n;
+        };
+        const walk = (node: ts.Node): void => {
+          if (ts.isCallExpression(node)) {
+            if (ts.isIdentifier(node.expression)) {
+              callees.push({ name: node.expression.text, node });
+            } else if (
+              ts.isPropertyAccessExpression(node.expression) &&
+              (node.expression.name.text === "push" || node.expression.name.text === "splice")
+            ) {
+              noteWrite(node);
+            }
+          }
+          if (ts.isReturnStatement(node) && node.expression) hasValueReturn = true;
+          if (ts.isBinaryExpression(node)) {
+            const op = node.operatorToken.kind;
+            if (op >= ts.SyntaxKind.FirstAssignment && op <= ts.SyntaxKind.LastAssignment) {
+              if (ts.isPropertyAccessExpression(unwrapParen(node.left))) noteWrite(node);
+            }
+          }
+          if (
+            (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+            (node.operator === ts.SyntaxKind.PlusPlusToken ||
+              node.operator === ts.SyntaxKind.MinusMinusToken) &&
+            ts.isPropertyAccessExpression(unwrapParen(node.operand))
+          ) {
+            noteWrite(node);
+          }
+          ts.forEachChild(node, walk);
+        };
+        walk(stmt.body);
         const binding: FnBinding = {
           kind: "fn",
           name: stmt.name.text,
@@ -589,6 +655,11 @@ class AppCompiler {
           emitted: false,
           deps: new Set(),
           params,
+          paramTys,
+          result,
+          callees,
+          writeNode,
+          hasValueReturn,
         };
         this.scope.set(stmt.name.text, binding);
         this.fns.push(binding);
@@ -630,6 +701,71 @@ class AppCompiler {
       } else this.err(stmt, `unsupported setup statement: ${ts.SyntaxKind[stmt.kind]}`);
     }
     if (!this.template) this.err(component, "component never returned JSX");
+    this.analyzeHelpers();
+  }
+
+  /** Static checks over the setup-helper call graph: no recursion (the
+   * overlay allocator and the no-C-stack design both assume acyclic calls),
+   * and a `: number` helper must be pure — no writes of its own, and every
+   * helper it calls returns a number too. Since cycles are rejected, the
+   * per-node checks imply transitive purity. */
+  private analyzeHelpers(): void {
+    const byName = new Map(this.fns.map((b) => [b.name, b]));
+    const WHITE = 0;
+    const GRAY = 1;
+    const BLACK = 2;
+    const color = new Map<string, number>();
+    const dfs = (b: FnBinding): void => {
+      color.set(b.name, GRAY);
+      for (const edge of b.callees) {
+        const callee = byName.get(edge.name);
+        if (!callee) continue; // unknown callees are diagnosed in compileCall
+        const c = color.get(callee.name) ?? WHITE;
+        if (c === GRAY)
+          this.err(edge.node, `recursive helper call through '${callee.name}': recursion is not supported`);
+        if (c === WHITE) dfs(callee);
+      }
+      color.set(b.name, BLACK);
+    };
+    for (const b of this.fns) if ((color.get(b.name) ?? WHITE) === WHITE) dfs(b);
+
+    for (const b of this.fns) {
+      if (b.result !== "num") continue;
+      if (!b.hasValueReturn)
+        this.err(b.decl, `helper '${b.name}' declares \`: number\` but never returns a value`);
+      if (!this.allPathsReturn(b.decl.body!))
+        this.err(
+          b.decl,
+          `helper '${b.name}' declares \`: number\` but can reach the end without returning a value`,
+        );
+      if (b.writeNode)
+        this.err(
+          b.writeNode,
+          "helpers that return a number must be pure (no .value or field writes)",
+        );
+      for (const edge of b.callees) {
+        const callee = byName.get(edge.name);
+        if (callee && callee.result !== "num")
+          this.err(
+            edge.node,
+            `number helper '${b.name}' can only call other number helpers; '${callee.name}' is a void helper`,
+          );
+      }
+    }
+  }
+
+  /** Conservative "returns on every path": a trailing return, or an
+   * if/else whose arms both return. Loops don't count (they may run zero
+   * times). Keeps the emitted s32 function from falling off its end. */
+  private allPathsReturn(stmt: ts.Statement): boolean {
+    if (ts.isBlock(stmt)) {
+      const last = stmt.statements[stmt.statements.length - 1];
+      return !!last && this.allPathsReturn(last);
+    }
+    if (ts.isReturnStatement(stmt)) return true;
+    if (ts.isIfStatement(stmt))
+      return !!stmt.elseStatement && this.allPathsReturn(stmt.thenStatement) && this.allPathsReturn(stmt.elseStatement);
+    return false;
   }
 
   private scanSetupConst(stmt: ts.VariableStatement): void {
@@ -837,6 +973,8 @@ class AppCompiler {
         const b = this.scope.get(value.text);
         if (b?.kind !== "fn") this.err(value, "keymap values must be arrows or setup functions");
         if (b.params.length !== 0) this.err(value, `${b.name} takes arguments; wrap it in an arrow`);
+        if (b.result === "num")
+          this.err(value, `keymap action '${b.name}' cannot return a value; use a void helper`);
         this.emitFn(b);
         entries.set(key, `fn_${b.name}`);
       } else this.err(pa.initializer, "keymap values must be arrows or setup functions");
@@ -848,6 +986,8 @@ class AppCompiler {
 
   private compileActionArrow(cName: string, arrow: ts.ArrowFunction): void {
     const saved = new Map(this.scope);
+    const prevResult = this.curFnResult;
+    this.curFnResult = "void";
     const { decls, body } = this.withOwner(cName, () => this.withHoist((out) => {
       if (ts.isBlock(arrow.body)) {
         for (const stmt of arrow.body.statements) this.compileStmt(stmt, out, "  ");
@@ -855,6 +995,7 @@ class AppCompiler {
         this.compileExprStmt(arrow.body, out, "  ");
       }
     }));
+    this.curFnResult = prevResult;
     this.scope = saved;
     this.bodies.push(`static void ${cName}(void) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
@@ -1521,7 +1662,7 @@ class AppCompiler {
         this.emitFn(b);
         for (const d of b.deps) this.depRef(d);
         this.ovlCall(`fn_${b.name}`);
-        return { c: `fn_${b.name}(${args.join(", ")})`, ty: { k: "void" } };
+        return { c: `fn_${b.name}(${args.join(", ")})`, ty: b.result === "num" ? NUM : { k: "void" } };
       }
     }
     this.err(e, "unsupported call");
@@ -1638,6 +1779,14 @@ class AppCompiler {
 
   private compileStmt(stmt: ts.Statement, out: string[], ind: string): void {
     if (ts.isReturnStatement(stmt)) {
+      if (this.curFnResult === "num") {
+        if (!stmt.expression) this.err(stmt, "number helper must return a number");
+        const v = this.compileExpr(stmt.expression, out, ind);
+        if (v.ty.k !== "num" && v.ty.k !== "bool")
+          this.err(stmt.expression!, `number helper must return a number, got ${v.ty.k}`);
+        out.push(`${ind}return ${v.c};`);
+        return;
+      }
       if (stmt.expression) this.err(stmt, "handlers cannot return values");
       out.push(`${ind}return;`);
       return;
@@ -2019,15 +2168,21 @@ class AppCompiler {
     b.emitted = true; // set first: recursion guard
     const prevDeps = this.curDeps;
     this.curDeps = b.deps;
+    const prevResult = this.curFnResult;
+    this.curFnResult = b.result;
     const saved = new Map(this.scope);
     const { decls, body } = this.withOwner(`fn_${b.name}`, () => this.withHoist((out) => {
-      for (const p of b.params) this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: NUM });
+      b.params.forEach((p, i) =>
+        this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: b.paramTys[i] === "bool" ? BOOL : NUM }),
+      );
       for (const stmt of b.decl.body!.statements) this.compileStmt(stmt, out, "  ");
     }));
     this.scope = saved;
+    this.curFnResult = prevResult;
     this.curDeps = prevDeps;
     const sig = b.params.length ? b.params.map((p) => `s32 p_${p}`).join(", ") : "void";
-    this.bodies.push(`static void fn_${b.name}(${sig}) {\n${[...decls, ...body].join("\n")}\n}\n`);
+    const ret = b.result === "num" ? "s32" : "void";
+    this.bodies.push(`static ${ret} fn_${b.name}(${sig}) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
 
   // ---- JSX -> effects -------------------------------------------------------
@@ -2415,6 +2570,8 @@ class AppCompiler {
     let handlerOut: string[] = [];
     {
       const saved = new Map(this.scope);
+      const prevResult = this.curFnResult;
+      this.curFnResult = "void";
       const param = this.handler.parameters[0]?.name.getText(this.sf);
       if (!param) this.err(this.handler, "onButton arrow needs a (b) param");
       this.scope.set(param, { kind: "local", cName: "b_arg", ty: NUM });
@@ -2426,6 +2583,7 @@ class AppCompiler {
           this.compileExprStmt(handlerArrow.body, out, "  ");
         }
       }));
+      this.curFnResult = prevResult;
       handlerOut = [...decls, ...body];
       this.scope = saved;
     }
@@ -2434,6 +2592,8 @@ class AppCompiler {
     const axisHandlerCases: string[] = [];
     for (const [axis, handler] of [...this.axisHandlers].sort(([a], [b]) => a - b)) {
       const saved = new Map(this.scope);
+      const prevResult = this.curFnResult;
+      this.curFnResult = "void";
       const parameter = handler.parameters[0];
       if (!parameter || !ts.isIdentifier(parameter.name))
         this.err(handler, "onAxisDelta arrow needs a simple delta parameter");
@@ -2449,6 +2609,7 @@ class AppCompiler {
           this.compileExprStmt(handler.body, out, "  ");
         }
       }));
+      this.curFnResult = prevResult;
       axisHandlerFns.push(
         `static void vp_axis_handler_${axis}(s32 axis_delta_arg) {\n${[...decls, ...body].join("\n")}\n}`,
       );
