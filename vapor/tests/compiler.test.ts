@@ -1645,6 +1645,127 @@ export default () => {
     }
   });
 
+  // ---- recursive helpers are rejected (review task 1024 B2) --------------
+
+  const recApp = (imp: string) => `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+${imp}
+export default () => {
+  const n = ref(0);
+  onButton((b) => {});
+  return (<><row y={0}>{n.value}</row></>);
+};
+`;
+
+  test("rejects a directly recursive module helper with file:line:col", async () => {
+    // call to go(n - 1) is on line 1 col 40
+    const mod = `export function go(n: number) { if (n > 0) go(n - 1); }\n`;
+    let msg = "";
+    const proj = await makeProject({ "mod.ts": mod, "app.tsx": recApp('import { go } from "./mod.ts";') });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/mod\.ts:1:44 — .*recursi/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a directly recursive module helper that is never called", async () => {
+    // static analysis must reject the declaration cycle even when the app
+    // never invokes the helper (no reachability escape hatch).
+    const mod = `export function loop(n: number) { if (n > 0) loop(n - 1); }\n`;
+    let msg = "";
+    const proj = await makeProject({ "mod.ts": mod, "app.tsx": recApp('import { loop } from "./mod.ts";') });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/mod\.ts:1:\d+ .*recursi/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects mutually recursive helpers inside one module", async () => {
+    const mod =
+      "export function a(n: number) { if (n > 0) b(n - 1); }\n" +
+      "export function b(n: number) { if (n > 0) a(n - 1); }\n";
+    let msg = "";
+    const proj = await makeProject({ "mod.ts": mod, "app.tsx": recApp('import { a } from "./mod.ts";') });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/mod\.ts:[12]:\d+ .*recursi/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a directly recursive in-file setup helper", async () => {
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+export default () => {
+  const n = ref(0);
+  function go(n: number) { if (n > 0) go(n - 1); }
+  onButton((b) => { if (b === Button.A) go(1); });
+  return (<><row y={0}>{n.value}</row></>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/app\.tsx:6:39 — .*recursi/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects mutually recursive in-file setup helpers", async () => {
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+export default () => {
+  const n = ref(0);
+  function a(x: number) { if (x > 0) { b(x - 1); } }
+  function b(x: number) { if (x > 0) { a(x - 1); } }
+  onButton((bb) => { if (bb === Button.A) a(1); });
+  return (<><row y={0}>{n.value}</row></>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/app\.tsx:[67]:40 — .*recursi/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
 });
 
 function APP_TUX_MISSING(): string {

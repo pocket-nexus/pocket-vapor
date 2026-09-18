@@ -528,6 +528,10 @@ class AppCompiler {
       foldConst: (e) => this.constNum(e) ?? this.constBool(e),
     });
     this.scanSetup(component);
+    // The subset forbids recursion (generated C is stack-fixed and uses
+    // forward-only emission). Check one static call graph over in-file setup
+    // helpers and every imported module helper before emitting any C.
+    this.rejectRecursiveHelpers();
     return this.emit();
   }
 
@@ -843,6 +847,167 @@ class AppCompiler {
       this.curDeps = savedCurDeps;
       this.hoist = savedHoist;
     }
+  }
+
+  /** Reject any recursion among setup helpers and imported module helpers.
+   * The subset emits forward-only, stack-fixed C with no recursion, so the
+   * check runs once over a single static call graph before C emission. A
+   * call is resolved the same way the emitter resolves it — the helper's
+   * own module scope (or the component scope for in-file helpers) — with
+   * params and block-local `const`/`let` names shadowing helpers. */
+  private rejectRecursiveHelpers(): void {
+    const all: FnBinding[] = [...this.fns];
+    for (const rec of this.moduleRecords.values()) all.push(...rec.helpers);
+
+    // Per-helper lexical base environment (name -> fn binding). A module
+    // helper resolves calls in its own module scope; an in-file setup helper
+    // resolves them in the component scope (sibling helpers + imports).
+    const fnEnv = (fn: FnBinding): Map<string, Binding> => fn.moduleScope ?? this.scope;
+    const baseFns = new Map<FnBinding, Map<string, FnBinding>>();
+    for (const fn of all) {
+      const fns = new Map<string, FnBinding>();
+      for (const [name, b] of fnEnv(fn)) if (b.kind === "fn") fns.set(name, b);
+      baseFns.set(fn, fns);
+    }
+
+    // Static call edges with one representative call site per edge (the
+    // first encountered), used for the file:line:col diagnostic.
+    const edges = new Map<FnBinding, Set<FnBinding>>();
+    const edgeSite = new Map<string, ts.CallExpression>();
+    const record = (caller: FnBinding, callee: FnBinding, node: ts.CallExpression): void => {
+      let set = edges.get(caller);
+      if (!set) edges.set(caller, (set = new Set()));
+      set.add(callee);
+      const key = `${caller.cName}->${callee.cName}`;
+      if (!edgeSite.has(key)) edgeSite.set(key, node);
+    };
+
+    for (const fn of all) {
+      const fns = baseFns.get(fn)!;
+      const shadows = new Set(fn.params);
+      for (const stmt of fn.decl.body!.statements)
+        this.walkStmtCalls(stmt, shadows, fns, (callee, node) => record(fn, callee, node));
+    }
+
+    // DFS with tri-color marking; a gray neighbor is a back edge (cycle).
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map<FnBinding, number>(all.map((fn) => [fn, WHITE]));
+    const stack: FnBinding[] = [];
+    const visit = (fn: FnBinding): void => {
+      color.set(fn, GRAY);
+      stack.push(fn);
+      for (const callee of edges.get(fn) ?? []) {
+        if (color.get(callee) === GRAY) {
+          const cycle = [...stack.slice(stack.indexOf(callee)), callee].map((h) => h.name).join(" -> ");
+          const site = edgeSite.get(`${fn.cName}->${callee.cName}`)!;
+          this.err(
+            site,
+            `recursive helper call is not supported in the vapor subset (${cycle}); generated C is non-recursive — restructure with a loop`,
+          );
+        }
+        if (color.get(callee) === WHITE) visit(callee);
+      }
+      stack.pop();
+      color.set(fn, BLACK);
+    };
+    for (const fn of all) if (color.get(fn) === WHITE) visit(fn);
+  }
+
+  /** Walk a helper-body statement in execution order, mirroring compileStmt's
+   * scoping: block locals shadow outer names only from their declaration on. */
+  private walkStmtCalls(
+    stmt: ts.Statement,
+    shadows: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    if (ts.isReturnStatement(stmt)) {
+      if (stmt.expression) this.walkExprCalls(stmt.expression, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isIfStatement(stmt)) {
+      this.walkExprCalls(stmt.expression, shadows, fns, onCall);
+      this.walkStmtCalls(stmt.thenStatement, shadows, fns, onCall);
+      if (stmt.elseStatement) this.walkStmtCalls(stmt.elseStatement, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isBlock(stmt)) {
+      this.walkStmtList(stmt.statements, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isVariableStatement(stmt)) {
+      this.walkVarList(stmt.declarationList.declarations, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isForStatement(stmt)) {
+      const inner = new Set(shadows);
+      if (stmt.initializer && ts.isVariableDeclarationList(stmt.initializer))
+        this.walkVarList(stmt.initializer.declarations, inner, fns, onCall);
+      if (stmt.condition) this.walkExprCalls(stmt.condition, inner, fns, onCall);
+      if (stmt.incrementor) this.walkExprCalls(stmt.incrementor, inner, fns, onCall);
+      this.walkStmtCalls(stmt.statement, inner, fns, onCall);
+      return;
+    }
+    if (ts.isExpressionStatement(stmt)) {
+      this.walkExprCalls(stmt.expression, shadows, fns, onCall);
+      return;
+    }
+    // Any statement form outside the void-helper subset is rejected later by
+    // the real pipeline; descend generically so a nested call is still seen.
+    ts.forEachChild(stmt, (child) => {
+      if (child && ts.isStatement(child)) this.walkStmtCalls(child, shadows, fns, onCall);
+      else if (child) this.walkExprCalls(child as ts.Expression, shadows, fns, onCall);
+    });
+  }
+
+  private walkStmtList(
+    stmts: ts.NodeArray<ts.Statement>,
+    outer: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    const inner = new Set(outer);
+    for (const stmt of stmts) {
+      if (ts.isVariableStatement(stmt)) this.walkVarList(stmt.declarationList.declarations, inner, fns, onCall);
+      else this.walkStmtCalls(stmt, inner, fns, onCall);
+    }
+  }
+
+  private walkVarList(
+    decls: ts.NodeArray<ts.VariableDeclaration>,
+    shadows: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    for (const decl of decls) {
+      if (decl.initializer) this.walkExprCalls(decl.initializer, shadows, fns, onCall);
+      // The local binds only after its initializer.
+      if (ts.isIdentifier(decl.name)) shadows.add(decl.name.text);
+    }
+  }
+
+  private walkExprCalls(
+    node: ts.Node,
+    shadows: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      const callee = shadows.has(node.expression.text) ? undefined : fns.get(node.expression.text);
+      if (callee) onCall(callee, node);
+    }
+    // Arrow params introduce a new lexical scope (defensive: helper args are
+    // numbers, but a callback's params must not resolve as helper names).
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      const inner = new Set(shadows);
+      for (const p of node.parameters) if (ts.isIdentifier(p.name)) inner.add(p.name.text);
+      if (ts.isBlock(node.body)) this.walkStmtList(node.body.statements, inner, fns, onCall);
+      else this.walkExprCalls(node.body, inner, fns, onCall);
+      return;
+    }
+    ts.forEachChild(node, (child) => {
+      if (child) this.walkExprCalls(child, shadows, fns, onCall);
+    });
   }
 
   private scanInterface(
