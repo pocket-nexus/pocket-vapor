@@ -271,6 +271,83 @@ export default () => {
   });
 });
 
+// Record string fields are pooled `vp_sb` structs; a dynamic index reads one
+// byte through vp_sb_at (space sentinel out of range, same as vp_char_at).
+describe("record string field indexed read", () => {
+  const BOARD = `${HEADER}
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }, { text: "xyz" }]);
+  const x = ref(1);
+  onButton((b) => { if (b === Button.A) x.value = 2; });
+  return (<>{rows.value.map((rr, i) => <row y={i}>{rr.text[x.value]}</row>)}</>);
+};
+`;
+
+  test("renders a dynamic char read through vp_sb_at (render path)", () => {
+    const app = compileVaporApp("board.tsx", BOARD, "BOARD", "gba");
+    expect(app.c).toContain("vp_sb_at(");
+    // the map-row record field is read one byte at a time as a char
+    expect(app.c).toMatch(/vp_ln_ch\(vp_sb_at\(&t\d+->text, g_x\)\)/);
+    // the map effect subscribes to rows (pool) and x (index ref)
+    expect(app.graph).toMatch(/mask 0x[0-9a-f]+ \{rows, x\}|mask 0x[0-9a-f]+ \{x, rows\}/);
+  });
+
+  test("vp_sb_at reads inside an if-condition and on a standalone string ref", () => {
+    const source = `${HEADER}
+const CH = "#.";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "#." }]);
+  const scratch = ref("AB");
+  const x = ref(0);
+  onButton((b) => {
+    if (b === Button.A) x.value = 1;
+    const t = rows.value[0];
+    if (t && t.text[x.value] === CH[0]) scratch.value = "hit";
+  });
+  return (<><row y={0}>{scratch.value[x.value]}</row></>);
+};
+`;
+    const app = compileVaporApp("board.tsx", source, "BOARD", "gba");
+    // record field char compared to a ROM const-string char (Sokoban form)
+    expect(app.c).toMatch(/vp_sb_at\(&l_t_\d+->text, g_x\) == vp_char_at\(S\d+, 2, 0\)/);
+    // dynamic index also works on a standalone ref<string>
+    expect(app.c).toContain("vp_sb_at(&g_scratch, g_x)");
+  });
+
+  test("out-of-range read is the space sentinel (bounded, no tripwire)", () => {
+    const app = compileVaporApp("board.tsx", BOARD, "BOARD", "gba");
+    // the inline lives in the emitted C with the same contract as vp_char_at
+    expect(app.c).toContain(
+      "static inline char VP_UNUSED_FN vp_sb_at(const vp_sb *s, s32 i) { return (i >= 0 && i < (s32)s->len) ? s->b[i] : ' '; }",
+    );
+  });
+
+  test("rejects indexing a number record field", () => {
+    const source = `${HEADER}
+interface Cell { k: number }
+export default () => {
+  const cells = ref<Cell[]>([{ k: 1 }]);
+  const x = ref(0);
+  onButton((b) => {});
+  return (<><row y={0}>{cells.value[0] ? cells.value[0].k[x.value] : 0}</row></>);
+};
+`;
+    const msg = compileErr(source);
+    expect(msg).toContain("indexing number/boolean record fields is not supported");
+    expect(msg).toMatch(/^test\.tsx:\d+:\d+/);
+  });
+
+  test("todo keeps the inline definition but has no vp_sb_at call site", () => {
+    // the helper is emitted unconditionally (like vp_char_at); each backend
+    // dead-strips an uncalled static inline, so todo's ROM is unchanged.
+    const app = compileVaporApp("todo.tsx", TODO_SOURCE, "VAPOR TODO", "gba");
+    const defs = app.c.match(/vp_sb_at/g) ?? [];
+    expect(defs.length).toBe(1); // definition only, never called
+  });
+});
+
 // Dead data/functions: nm + grep showed no runtime reads (fleet task 822,
 // scout task-764 §4.2). The cartridge title ships via JS-side header patches
 // (rom.ts); GBA reads palette banks directly; the console runtimes never call

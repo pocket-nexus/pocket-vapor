@@ -1332,6 +1332,20 @@ class AppCompiler {
       );
       return { c: p, ty: { k: "obj", iface, listRef } };
     }
+
+    // record string field indexing: line.text[i] -> vp_sb_at (compileMember
+    // turns a string field into an `sb` pointer; standalone string refs too)
+    const obj = this.compileExpr(objExpr, out, ind);
+    if (obj.ty.k === "sb") return { c: `vp_sb_at(${obj.c}, ${idx.c})`, ty: { k: "char" } };
+    if (ts.isPropertyAccessExpression(objExpr)) {
+      const owner = this.compileExpr(objExpr.expression, out, ind);
+      if (owner.ty.k === "obj") {
+        this.err(
+          e,
+          `indexing number/boolean record fields is not supported (field ${objExpr.name.text})`,
+        );
+      }
+    }
     this.err(e, "unsupported indexing");
   }
 
@@ -2272,6 +2286,9 @@ class AppCompiler {
       "static inline const char *VP_UNUSED_FN vp_cstr_at(const char *const *arr, s32 n, s32 i) { return (i >= 0 && i < n) ? arr[i] : (const char *)\"\"; }",
     );
     c.push("static inline char VP_UNUSED_FN vp_char_at(const char *s, s32 n, s32 i) { return (i >= 0 && i < n) ? s[i] : ' '; }");
+    c.push(
+      "static inline char VP_UNUSED_FN vp_sb_at(const vp_sb *s, s32 i) { return (i >= 0 && i < (s32)s->len) ? s->b[i] : ' '; }",
+    );
     c.push("");
 
     // record structs
