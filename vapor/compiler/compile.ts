@@ -148,7 +148,8 @@ interface FnBinding {
   result: "void" | "num";
   /** setup-helper calls appearing in the body (static call graph) */
   callees: { name: string; node: ts.CallExpression }[];
-  /** first mutating statement in the body: ref/field write, ++/--, push, splice */
+  /** first mutating statement in the body: ref/field write, ++/--, push,
+   * splice, or an indirect (element-access) call such as keymap dispatch */
   writeNode: ts.Node | null;
   hasValueReturn: boolean;
 }
@@ -628,6 +629,12 @@ class AppCompiler {
               (node.expression.name.text === "push" || node.expression.name.text === "splice")
             ) {
               noteWrite(node);
+            } else if (ts.isElementAccessExpression(node.expression)) {
+              // indirect dispatch such as a keymap table `KM[i]?.()`: the
+              // static graph cannot name the callee, which may be a void
+              // action that writes refs. Count it as a possible write so the
+              // purity gate cannot be bypassed through a dispatch table.
+              noteWrite(node);
             }
           }
           if (ts.isReturnStatement(node) && node.expression) hasValueReturn = true;
@@ -741,7 +748,7 @@ class AppCompiler {
       if (b.writeNode)
         this.err(
           b.writeNode,
-          "helpers that return a number must be pure (no .value or field writes)",
+          "helpers that return a number must be pure (no .value or field writes, no push/splice, no indirect calls such as keymap dispatch)",
         );
       for (const edge of b.callees) {
         const callee = byName.get(edge.name);

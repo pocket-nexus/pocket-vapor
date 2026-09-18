@@ -406,6 +406,43 @@ export default () => {
     expect(compileErr(source)).toContain("void helper");
   });
 
+  test("rejects a number helper that smuggles a write through keymap dispatch", () => {
+    // KM[i]?.() is an element-access call: the static analyzer cannot see
+    // which void action runs, so it must count as a possible write. Without
+    // this gate a render effect could mutate refs via a "pure" helper.
+    const source = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function bump(): void { count.value = count.value + 1; }
+  const KM = { [Button.A]: bump };
+  function sneaky(t: number): number {
+    KM[Button.A]?.();
+    return t + 1;
+  }
+  onButton((b) => {});
+  return (<><row y={0}>{sneaky(count.value)}</row></>);
+};
+`;
+    expect(compileErr(source)).toContain("must be pure");
+  });
+
+  test("pure number helpers may still call pure property-access builtins", () => {
+    // the keymap-dispatch gate targets element-access calls only;
+    // Math.max/min and list.indexOf stay available inside number helpers
+    const source = `${HEADER}
+interface It { k: number }
+export default () => {
+  const items = ref<It[]>([{ k: 1 }, { k: 2 }]);
+  function clamped(x: number): number { return Math.max(0, Math.min(9, x)); }
+  onButton((b) => {});
+  return (<><row y={0}>{clamped(items.value.length)}</row></>);
+};
+`;
+    const app = compileVaporApp("test.tsx", source);
+    expect(app.c).toContain("static s32 fn_clamped(s32 p_x) {");
+    expect(app.c).toMatch(/vp_max\(0, vp_min\(9, p_x\)\)/);
+  });
+
   test("components inline to zero-cost paint code", async () => {
     const source = await Bun.file(ENTRY).text();
     const app = compileVaporApp(ENTRY, source);
