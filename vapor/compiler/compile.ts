@@ -1527,6 +1527,21 @@ class AppCompiler {
     this.err(e, "unsupported call");
   }
 
+  /**
+   * A string-literal `===`/`!==` operand classified WITHOUT compiling it:
+   * a bare "x" literal or a `const` alias of one, carrying its text so it can
+   * become a C char constant instead of an interned ROM array.
+   */
+  private classifyCmpLiteral(e: ts.Expression): { text: string; node: ts.Expression } | null {
+    e = this.unparen(e);
+    if (ts.isStringLiteral(e)) return { text: e.text, node: e };
+    if (ts.isIdentifier(e)) {
+      const b = this.scope.get(e.text);
+      if (b?.kind === "const" && typeof b.value === "string") return { text: b.value, node: e };
+    }
+    return null;
+  }
+
   private compileBinary(e: ts.BinaryExpression, out: string[], ind: string): { c: string; ty: Ty } {
     const op = e.operatorToken.kind;
     const K = ts.SyntaxKind;
@@ -1536,8 +1551,36 @@ class AppCompiler {
       const cop = op === K.AmpersandAmpersandToken ? "&&" : "||";
       return { c: `(${this.truthy(l)} ${cop} ${this.truthy(r)})`, ty: BOOL };
     }
-    const l = this.compileExpr(e.left, out, ind);
-    const r = this.compileExpr(e.right, out, ind);
+    let l: { c: string; ty: Ty } | undefined;
+    let r: { c: string; ty: Ty } | undefined;
+    // char vs one-char string literal: JS compares two one-char strings, but C
+    // sees `char` against a ROM `const char[N]`. gcc only warns; sdcc and
+    // cc65 reject it. Lower the literal side to a C char constant ('#').
+    if (op === K.EqualsEqualsEqualsToken || op === K.ExclamationEqualsEqualsToken) {
+      const ll = this.classifyCmpLiteral(e.left);
+      const rl = this.classifyCmpLiteral(e.right);
+      if ((ll || rl) && !(ll && rl)) {
+        const lit = (ll ?? rl)!;
+        const otherNode = ll ? e.right : e.left;
+        const other = this.compileExpr(otherNode, out, ind);
+        if (other.ty.k === "char") {
+          if (lit.text.length === 0) this.err(lit.node, "comparing a char to an empty string");
+          if (lit.text.length !== 1)
+            this.err(lit.node, "comparing a char to a multi-character string");
+          const ch = this.cCharLit(lit.text);
+          l = ll ? { c: ch, ty: { k: "char" } } : other;
+          r = rl ? { c: ch, ty: { k: "char" } } : other;
+        } else {
+          // not a char on the other side (strlit/num/...): keep the legacy
+          // pointer comparison path; the literal side emits no statements.
+          const litCompiled = this.compileExpr(lit.node, out, ind);
+          l = ll ? litCompiled : other;
+          r = rl ? litCompiled : other;
+        }
+      }
+    }
+    l ??= this.compileExpr(e.left, out, ind);
+    r ??= this.compileExpr(e.right, out, ind);
     const table: Partial<Record<ts.SyntaxKind, string>> = {
       [K.PlusToken]: "+",
       [K.MinusToken]: "-",
