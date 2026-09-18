@@ -376,3 +376,71 @@ hooks.__vaporTick = (): Promise<void> => nextTick();
     }
   });
 });
+
+// Imported interfaces are module-scoped: same-named interfaces in two
+// modules and an aliased import resolve per import site under real TS/Vue,
+// exactly as the AOT frontend now qualifies them (fleet task 1092, review
+// task 1024 B1). This is the acceptance counterpart to the rejection tests
+// in compiler.test.ts.
+describe("module-scoped imported interfaces under the real Vue oracle", () => {
+  const HOST = join(import.meta.dir, "..", "host", "input.ts");
+
+  const ENTRY_TS = `
+import { createVaporApp, nextTick } from "vue";
+import App from "./app.tsx";
+import { __resetButtons } from "${HOST}";
+const hooks = globalThis as Record<string, unknown>;
+hooks.__vaporBoot = (container: unknown) => {
+  __resetButtons();
+  const app = (createVaporApp as unknown as (c: unknown) => { mount(c: unknown): void; unmount(): void })({
+    setup: () => (App as () => unknown)(),
+  });
+  app.mount(container);
+  return app;
+};
+hooks.__vaporPress = (): void => {};
+hooks.__vaporAxisDelta = (): void => {};
+hooks.__vaporTick = (): Promise<void> => nextTick();
+`;
+
+  test("same-named Cell in two modules keeps each shape; aliased import resolves", async () => {
+    // a.ts Cell{x}, b.ts Cell{y}. App imports Cell from a.ts and Cell as
+    // Tile from b.ts, rendering both field sets — real Vue resolves them as
+    // distinct types and reads distinct properties.
+    const aTs = "export interface Cell { x: number }\nexport const AX = 7;\n";
+    const bTs = "export interface Cell { y: number }\nexport const BY = 9;\n";
+    const appTsx = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST}";
+import { Cell, AX } from "./a.ts";
+import { Cell as Tile, BY } from "./b.ts";
+export default () => {
+  const xs = ref<Cell[]>([{ x: AX }, { x: AX + 1 }]);
+  const ys = ref<Tile[]>([{ y: BY }]);
+  onButton((b) => {});
+  return (<>
+    {xs.value.map((c, i) => <row y={i}>x{c.x}</row>)}
+    {ys.value.map((c, i) => <row y={5 + i}>y{c.y}</row>)}
+  </>);
+};
+`;
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-oracle-iface-"));
+    try {
+      await writeFile(join(dir, "a.ts"), aTs);
+      await writeFile(join(dir, "b.ts"), bTs);
+      await writeFile(join(dir, "app.tsx"), appTsx);
+      await writeFile(join(dir, "entry.ts"), ENTRY_TS);
+      // AOT accepts and emits two distinct module-qualified records.
+      const compiled = compileVaporApp(join(dir, "app.tsx"), appTsx, "IFACE", "gba");
+      expect(compiled.c).toContain("typedef struct { s32 x; } rec_m0_cell;");
+      expect(compiled.c).toContain("typedef struct { s32 y; } rec_m1_cell;");
+      const o = await bootOracle({ width: 30, height: 20, styles: compiled.styles, entry: join(dir, "entry.ts") });
+      expect(o.grid().chars[0]).toBe("x7".padEnd(30));
+      expect(o.grid().chars[1]).toBe("x8".padEnd(30));
+      expect(o.grid().chars[5]).toBe("y9".padEnd(30));
+      o.unmount();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

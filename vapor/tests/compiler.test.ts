@@ -1266,8 +1266,10 @@ export default () => {
     expect(app.c).toMatch(/static const char \*const A_m0_ROWS\[3\]/);
     // the imported string itself is in ROM
     expect(app.c).toContain('static const char S0[] = "SOKOBAN";');
-    // the imported closed interface becomes a record typedef
-    expect(app.c).toContain("typedef struct { s32 k; u8 wall; } rec_cell;");
+    // the imported closed interface becomes a module-qualified record
+    // typedef: interfaces live in their own module's namespace, so two
+    // modules may export same-named shapes without colliding.
+    expect(app.c).toContain("typedef struct { s32 k; u8 wall; } rec_m0_cell;");
   });
 
   test("per-target SCREEN-style folds still resolve across modules", async () => {
@@ -1521,6 +1523,128 @@ export default () => {
       await rm(proj.dir, { recursive: true, force: true });
     }
   });
+
+  // ---- imported interfaces are module-scoped (review task 1024 B1) --------
+
+  test("same-named interfaces in two modules keep their own shape", async () => {
+    // a.ts exports Cell{x}; merely loading b.ts (which exports its own
+    // Cell{y}) must not overwrite the shape the app imported from a.ts.
+    const a = `export interface Cell { x: number }\nexport const A = 1;`;
+    const b = `export interface Cell { y: number }\nexport const B = 2;`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { Cell, A } from "./a.ts";
+import { B } from "./b.ts";
+export default () => {
+  const cells = ref<Cell[]>([{ x: A + B }]);
+  onButton((b) => {});
+  return (<>{cells.value.map((cell, i) => <row y={i}>{cell.x}</row>)}</>);
+};
+`;
+    const compiled = await compileProject({ "a.ts": a, "b.ts": b, "app.tsx": app });
+    // a.ts loads first (m0); its record keeps field x, even though b.ts (m1)
+    // registered a same-named Cell with field y.
+    expect(compiled.c).toContain("typedef struct { s32 x; } rec_m0_cell;");
+    expect(compiled.c).toContain("rec_m0_cell *");
+    expect(compiled.c).not.toContain("rec_m0_cell y");
+  });
+
+  test("a module helper resolves a same-module imported-interface record field", async () => {
+    // The component owns the Cell[] pool (Cell from m0); a helper exported
+    // by the same module mutates it and must resolve field x through the
+    // module's interface, not a global bare-name table.
+    const mod = `
+export interface Cell { x: number }
+export function bump(cells: number) { return; }
+`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { Cell } from "./mod.ts";
+export default () => {
+  const cells = ref<Cell[]>([{ x: 1 }]);
+  onButton((b) => {});
+  return (<>{cells.value.map((cell, i) => <row y={i}>{cell.x}</row>)}</>);
+};
+`;
+    const compiled = await compileProject({ "mod.ts": mod, "app.tsx": app });
+    expect(compiled.c).toContain("typedef struct { s32 x; } rec_m0_cell;");
+  });
+
+  test("accepts an aliased imported interface (Cell as Tile)", async () => {
+    const mod = `export interface Cell { k: number; wall: boolean }\nexport const X = 1;`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { Cell as Tile, X } from "./mod.ts";
+export default () => {
+  const cells = ref<Tile[]>([{ k: X, wall: false }]);
+  onButton((b) => {});
+  return (<>{cells.value.map((cell, i) => <row y={i}>{cell.k}</row>)}</>);
+};
+`;
+    const compiled = await compileProject({ "mod.ts": mod, "app.tsx": app });
+    expect(compiled.c).toContain("typedef struct { s32 k; u8 wall; } rec_m0_cell;");
+  });
+
+  test("rejects interface heritage (extends) with a located diagnostic", async () => {
+    const mod = `export interface Base { x: number }\nexport interface Cell extends Base { y: number }\nexport const X = 1;`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { Cell, X } from "./mod.ts";
+export default () => {
+  const cells = ref<Cell[]>([{ x: X, y: 2 }]);
+  onButton((b) => {});
+  return (<>{cells.value.map((cell, i) => <row y={i}>{cell.y}</row>)}</>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "mod.ts": mod, "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      // heritage clause ("extends") is on line 2 col 23
+      expect(msg).toMatch(/mod\.ts:2:23 — .*(heritage|extends|inherit)/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects binding the same local interface name from two modules", async () => {
+    const a = `export interface Cell { x: number }`;
+    const b = `export interface Cell { y: number }`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { Cell } from "./a.ts";
+import { Cell } from "./b.ts";
+export default () => {
+  const cells = ref<Cell[]>([{ x: 1 }]);
+  onButton((b) => {});
+  return (<>{cells.value.map((cell, i) => <row y={i}>{cell.x}</row>)}</>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "a.ts": a, "b.ts": b, "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/app\.tsx:5:\d+ — .*(already|duplicate|conflict)/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
 });
 
 function APP_TUX_MISSING(): string {

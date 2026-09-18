@@ -111,8 +111,19 @@ const NUM: Ty = { k: "num" };
 const BOOL: Ty = { k: "bool" };
 
 interface IfaceShape {
-  name: string;
+  name: string; // declared name, for diagnostics
+  /** Unique identity and C struct suffix. In-file interfaces keep the bare
+   * lowercased name (`cell`); an interface declared in imported module idx N
+   * is qualified (`m0_cell`) so two modules may export same-named shapes. */
+  id: string;
   fields: { name: string; ty: "str" | "bool" | "num" }[];
+}
+
+/** An exported interface carries no runtime binding; it only maps the
+ * importer's local type name to the interface's module-qualified id. */
+interface IfaceBinding {
+  kind: "iface";
+  id: string;
 }
 
 interface RefBinding {
@@ -215,7 +226,8 @@ type Binding =
   | ConstBinding
   | LocalBinding
   | KeymapBinding
-  | ComponentBinding;
+  | ComponentBinding
+  | IfaceBinding;
 
 // ---------------------------------------------------------------------------
 // Compiler
@@ -261,6 +273,14 @@ export function compileVaporApp(
 
 class AppCompiler {
   private ifaces = new Map<string, IfaceShape>();
+  /** Component-side type namespace: local type name -> qualified iface id.
+   * Kept separate from the runtime `scope`: interfaces are erased at runtime
+   * but must still resolve by their imported (possibly aliased) local name,
+   * and two imports must not silently share one bare-name shape. */
+  private typeNames = new Map<string, string>();
+  /** Type namespace currently being populated: the component's `typeNames`
+   * at top level, swapped for the module's own map while loading a module. */
+  private activeTypeNames = this.typeNames;
   private scope = new Map<string, Binding>();
   private refs: RefBinding[] = [];
   private computeds: ComputedBinding[] = [];
@@ -488,7 +508,7 @@ class AppCompiler {
     let component: ts.ArrowFunction | null = null;
     for (const stmt of this.sf.statements) {
       if (ts.isImportDeclaration(stmt)) this.scanImport(stmt, this.sf, dirname(this.sf.fileName));
-      else if (ts.isInterfaceDeclaration(stmt)) this.scanInterface(stmt);
+      else if (ts.isInterfaceDeclaration(stmt)) this.scanInterface(stmt, null, this.typeNames);
       else if (ts.isTypeAliasDeclaration(stmt)) continue; // types are erased
       else if (ts.isFunctionDeclaration(stmt)) this.scanComponent(stmt);
       else if (ts.isVariableStatement(stmt)) this.scanModuleConst(stmt);
@@ -600,11 +620,22 @@ class AppCompiler {
     const mod = this.loadModule(from, stmt, baseDir);
     for (const spec of bindings.elements) {
       const imported = (spec.propertyName ?? spec.name).text;
+      const local = spec.name.text;
       const binding = mod.exports.get(imported);
       if (!binding) this.err(spec, `module "${from}" does not export ${imported}`);
-      // interfaces are erased types: nothing to bind at runtime
-      if (binding === "interface") continue;
-      this.scope.set(spec.name.text, binding);
+      if (binding.kind === "iface") {
+        // Erased at runtime, but the local (possibly aliased) type name must
+        // resolve in *this* file's type namespace to the interface's own
+        // qualified id, so same-named exports never share a shape.
+        if (this.activeTypeNames.has(local))
+          this.err(
+            spec,
+            `duplicate interface name ${local}: already declared or imported in this module`,
+          );
+        this.activeTypeNames.set(local, binding.id);
+        continue;
+      }
+      this.scope.set(local, binding);
     }
   }
 
@@ -625,12 +656,14 @@ class AppCompiler {
    * captured at scan time; when one of its helpers is emitted/validated it is
    * layered on top of the component scope, so a module helper has the same
    * powers as an in-file helper (reads/writes of component refs) while its
-   * own consts and sibling helpers take precedence. */
+   * own consts and sibling helpers take precedence. `typeNames` is the
+   * module's local type namespace: a type name it declares or imports,
+   * mapped to the interface's module-qualified id. */
   private moduleRecords = new Map<
     string,
     {
-      exports: Map<string, Binding | "interface">;
-      interfaces: Set<string>;
+      exports: Map<string, Binding>;
+      typeNames: Map<string, string>;
       scope: Map<string, Binding>;
       helpers: FnBinding[];
     }
@@ -641,8 +674,8 @@ class AppCompiler {
     importNode: ts.ImportDeclaration,
     baseDir: string,
   ): {
-    exports: Map<string, Binding | "interface">;
-    interfaces: Set<string>;
+    exports: Map<string, Binding>;
+    typeNames: Map<string, string>;
     scope: Map<string, Binding>;
     helpers: FnBinding[];
   } {
@@ -666,10 +699,12 @@ class AppCompiler {
     const idx = this.moduleCount++;
     this.moduleStack.push(path);
     const savedScope = this.scope;
+    const savedTypes = this.activeTypeNames;
     const modScope = new Map<string, Binding>();
+    const modTypes = new Map<string, string>();
     this.scope = modScope;
-    const exports = new Map<string, Binding | "interface">();
-    const interfaces = new Set<string>();
+    this.activeTypeNames = modTypes;
+    const exports = new Map<string, Binding>();
     const helpers: FnBinding[] = [];
     try {
       for (const stmt of modSf.statements) {
@@ -684,8 +719,8 @@ class AppCompiler {
         if (ts.isInterfaceDeclaration(stmt)) {
           if (!isExported)
             this.err(stmt, "imported modules may only contain `export interface` declarations");
-          this.scanInterface(stmt);
-          exports.set(stmt.name.text, "interface");
+          const shape = this.scanInterface(stmt, idx, modTypes);
+          exports.set(stmt.name.text, { kind: "iface", id: shape.id });
           continue;
         }
         if (ts.isFunctionDeclaration(stmt)) {
@@ -716,9 +751,10 @@ class AppCompiler {
       }
     } finally {
       this.scope = savedScope;
+      this.activeTypeNames = savedTypes;
       this.moduleStack.pop();
     }
-    const record = { exports, interfaces, scope: modScope, helpers };
+    const record = { exports, typeNames: modTypes, scope: modScope, helpers };
     this.moduleRecords.set(path, record);
     // Bodies validate after every declaration is in the module scope so
     // helpers may call each other in any order (function hoisting semantics).
@@ -809,7 +845,21 @@ class AppCompiler {
     }
   }
 
-  private scanInterface(decl: ts.InterfaceDeclaration): void {
+  private scanInterface(
+    decl: ts.InterfaceDeclaration,
+    modIdx: number | null,
+    localTypeNames: Map<string, string>,
+  ): IfaceShape {
+    // Heritage is not in the closed-record subset: reject it with a located
+    // diagnostic at the `extends` keyword rather than crashing later.
+    for (const clause of decl.heritageClauses ?? []) {
+      if (clause.token === ts.SyntaxKind.ExtendsKeyword)
+        this.err(
+          clause,
+          `interface inheritance ("extends") is not supported in the vapor subset — flatten ${decl.name.text}'s inherited fields into one closed interface`,
+        );
+      this.err(clause, `unsupported interface heritage clause (${ts.SyntaxKind[clause.token]})`);
+    }
     const fields: IfaceShape["fields"] = [];
     for (const member of decl.members) {
       if (!ts.isPropertySignature(member) || !member.type || !ts.isIdentifier(member.name))
@@ -822,7 +872,16 @@ class AppCompiler {
         ty: tyText === "string" ? "str" : tyText === "boolean" ? "bool" : "num",
       });
     }
-    this.ifaces.set(decl.name.text, { name: decl.name.text, fields });
+    const bare = decl.name.text;
+    if (localTypeNames.has(bare)) this.err(decl.name, `duplicate interface ${bare}`);
+    // Qualified identity keeps same-named interfaces in different modules
+    // from sharing a record shape. In-file interfaces keep the bare name so
+    // existing single-file apps are byte-identical.
+    const id = modIdx === null ? bare.toLowerCase() : `m${modIdx}_${bare.toLowerCase()}`;
+    const shape: IfaceShape = { name: bare, id, fields };
+    this.ifaces.set(id, shape);
+    localTypeNames.set(bare, id);
+    return shape;
   }
 
   private scanModuleConst(
@@ -1150,8 +1209,13 @@ class AppCompiler {
   private listIfaceOf(call: ts.CallExpression, seed: ts.Expression): string {
     const typeArg = call.typeArguments?.[0];
     if (typeArg && ts.isArrayTypeNode(typeArg) && ts.isTypeReferenceNode(typeArg.elementType)) {
-      const name = typeArg.elementType.typeName.getText(this.sf);
-      if (this.ifaces.has(name)) return name;
+      const refNode = typeArg.elementType.typeName;
+      if (ts.isIdentifier(refNode)) {
+        // Resolve through the component's type namespace so imported and
+        // aliased interfaces map to their module-qualified id.
+        const id = this.typeNames.get(refNode.text);
+        if (id !== undefined && this.ifaces.has(id)) return id;
+      }
     }
     this.err(seed, "list refs need an explicit ref<T[]>(...) annotation with a declared interface T");
   }
@@ -1414,8 +1478,8 @@ class AppCompiler {
         ? { store: `static ${viewCName}`, accessor: `static const ${viewCName} *`, result: `&c_${name}_v` }
         : binding.valTy.k === "obj"
           ? {
-              store: `static rec_${binding.valTy.iface.toLowerCase()} *`,
-              accessor: `static rec_${binding.valTy.iface.toLowerCase()} *`,
+              store: `static rec_${binding.valTy.iface} *`,
+              accessor: `static rec_${binding.valTy.iface} *`,
               result: `c_${name}_v`,
             }
           : { store: "static s32", accessor: "static s32 ", result: `c_${name}_v` };
@@ -2427,7 +2491,7 @@ class AppCompiler {
     if (!arg || !ts.isObjectLiteralExpression(arg)) this.err(call, "push takes an object literal");
     const iface = this.ifaces.get(b.iface!)!;
     out.push(`${ind}if (g_${listRef}_len < ${this.listCap(listRef)}) {`);
-    out.push(`${ind}  rec_${iface.name.toLowerCase()} *np = g_${listRef} + (u16)(g_${listRef}_len++);`);
+    out.push(`${ind}  rec_${iface.id} *np = g_${listRef} + (u16)(g_${listRef}_len++);`);
     for (const propNode of arg.properties) {
       if (!ts.isPropertyAssignment(propNode) || !ts.isIdentifier(propNode.name))
         this.err(propNode, "push object must use `field: value`");
@@ -3039,7 +3103,7 @@ class AppCompiler {
       const fields = this.recordFields(iface)
         .map((f) => (f.ty === "str" ? `vp_sb ${f.name};` : f.ty === "bool" ? `u8 ${f.name};` : `s32 ${f.name};`))
         .join(" ");
-      c.push(`typedef struct { ${fields} } rec_${iface.name.toLowerCase()};`);
+      c.push(`typedef struct { ${fields} } rec_${iface.id};`);
     }
     // Per-list view types: a declared withCapacity cap narrows (or widens)
     // the idx[] array vs the runtime's default-capped vp_view.
