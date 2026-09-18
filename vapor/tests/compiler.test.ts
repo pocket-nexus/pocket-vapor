@@ -341,12 +341,16 @@ export default () => {
     expect(msg).toMatch(/^test\.tsx:\d+:\d+/);
   });
 
-  test("todo keeps the inline definition but has no vp_sb_at call site", () => {
-    // the helper is emitted unconditionally (like vp_char_at); each backend
-    // dead-strips an uncalled static inline, so todo's ROM is unchanged.
-    const app = compileVaporApp("todo.tsx", TODO_SOURCE, "VAPOR TODO", "gba");
-    const defs = app.c.match(/vp_sb_at/g) ?? [];
-    expect(defs.length).toBe(1); // definition only, never called
+  test("todo omits the vp_sb_at definition and call site entirely", () => {
+    // vp_sb_at/vp_sb_put are emitted ON DEMAND (a compile-time use flag):
+    // gcc/cc65 dead-strip an unused static inline, but sdcc (GB) compiles it
+    // into gen_app.rel and sdld keeps the whole object — todo's GB _CODE grew
+    // 184 B while the inline was emitted unconditionally (reviewer 1094 F1).
+    for (const target of ["gba", "gb", "nes", "esp32"] as const) {
+      const app = compileVaporApp("todo.tsx", TODO_SOURCE, "VAPOR TODO", target);
+      expect(app.c).not.toContain("vp_sb_at");
+      expect(app.c).not.toContain("vp_sb_put");
+    }
   });
 });
 
@@ -535,6 +539,25 @@ describe("dead data and dead functions are not emitted", () => {
       expect(names).not.toContain("app_on_axis_delta");
       // memcpy stays: struct assignment still lowers to it.
       expect(names).toContain("memcpy");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  // sdcc does NOT dead-strip an unused static inline: it lands in gen_app.rel
+  // and sdld keeps the whole object. Emitting vp_sb_at/vp_sb_put unconditionally
+  // grew todo's GB _CODE by 184 B (9320 -> 9504, reviewer 1094 F1). The ROM
+  // file stays 32768 B only because of 0xFF tail padding, so pin _CODE itself.
+  const sdcc = Bun.which("sdcc");
+  (sdcc ? test : test.skip)("gb _CODE does not grow from on-demand static inlines", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-gbcode-"));
+    try {
+      const app = compileVaporApp(ENTRY, TODO_SOURCE, "VAPOR TODO", "gb");
+      await buildRom(app, "gb", join(dir, "todo.gb"));
+      const map = await Bun.file(join(dir, "gen-gb", "app.map")).text();
+      const m = map.match(/_CODE\s+[0-9a-f]{8}\s+[0-9a-f]{8}\s+=\s+(\d+)\. bytes/);
+      expect(m).not.toBeNull();
+      expect(Number(m![1])).toBe(9320); // e1c1ce4 baseline; +184 if inlines are forced
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

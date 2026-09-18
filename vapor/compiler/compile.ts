@@ -262,6 +262,12 @@ class AppCompiler {
   private curDeps: Set<string> | null = null;
   private strLits = new Map<string, string>(); // literal -> C name
   private strArrays = new Map<string, string>();
+  // vp_sb_at/vp_sb_put are emitted only when the app actually lowers a record
+  // string field read/write through them. gcc/cc65 dead-strip an unused static
+  // inline, but sdcc (GB) keeps it in gen_app.rel and sdld links the object,
+  // so unconditional emission made todo's GB _CODE 184 B heavier (1094 F1).
+  private usedSbAt = false;
+  private usedSbPut = false;
 
   private styleTable = new StyleTable();
   private styleErrors: string[] = [];
@@ -1448,7 +1454,10 @@ class AppCompiler {
     // record string field indexing: line.text[i] -> vp_sb_at (compileMember
     // turns a string field into an `sb` pointer; standalone string refs too)
     const obj = this.compileExpr(objExpr, out, ind);
-    if (obj.ty.k === "sb") return { c: `vp_sb_at(${obj.c}, ${idx.c})`, ty: { k: "char" } };
+    if (obj.ty.k === "sb") {
+      this.usedSbAt = true;
+      return { c: `vp_sb_at(${obj.c}, ${idx.c})`, ty: { k: "char" } };
+    }
     if (ts.isPropertyAccessExpression(objExpr)) {
       const owner = this.compileExpr(objExpr.expression, out, ind);
       if (owner.ty.k === "obj") {
@@ -1876,6 +1885,7 @@ class AppCompiler {
         this.err(chNode, "putChar char must be a single char (a string index or a one-char literal)");
     }
 
+    this.usedSbPut = true;
     out.push(
       `${ind}if (vp_sb_put(&${recC}->${lhs.name.text}, ${idx.c}, ${ch.c})) ${this.markCode(listRef)};`,
     );
@@ -2466,15 +2476,20 @@ class AppCompiler {
       "static inline const char *VP_UNUSED_FN vp_cstr_at(const char *const *arr, s32 n, s32 i) { return (i >= 0 && i < n) ? arr[i] : (const char *)\"\"; }",
     );
     c.push("static inline char VP_UNUSED_FN vp_char_at(const char *s, s32 n, s32 i) { return (i >= 0 && i < n) ? s[i] : ' '; }");
-    c.push(
-      "static inline char VP_UNUSED_FN vp_sb_at(const vp_sb *s, s32 i) { return (i >= 0 && i < (s32)s->len) ? s->b[i] : ' '; }",
-    );
+    // Record string-field helpers are on-demand: the flags are set while
+    // lowering (all handler/effect bodies compile before this assembly), so
+    // apps like todo that never touch a record string byte pay nothing.
+    if (this.usedSbAt)
+      c.push(
+        "static inline char VP_UNUSED_FN vp_sb_at(const vp_sb *s, s32 i) { return (i >= 0 && i < (s32)s->len) ? s->b[i] : ' '; }",
+      );
     // putChar intrinsic. Out-of-range indices trip VP_TRIP_INDEX and leave
     // the string untouched; returns changed, gating the caller's vp_mark.
     // The `!=` guard (not an equality early return) avoids a cc65 2.18 -O crash.
-    c.push(
-      "static inline u8 VP_UNUSED_FN vp_sb_put(vp_sb *s, s32 i, char c) { if (i < 0 || i >= (s32)s->len) { vp_tripwires |= VP_TRIP_INDEX; return 0; } if (s->b[i] != c) { s->b[i] = c; return 1; } return 0; }",
-    );
+    if (this.usedSbPut)
+      c.push(
+        "static inline u8 VP_UNUSED_FN vp_sb_put(vp_sb *s, s32 i, char c) { if (i < 0 || i >= (s32)s->len) { vp_tripwires |= VP_TRIP_INDEX; return 0; } if (s->b[i] != c) { s->b[i] = c; return 1; } return 0; }",
+      );
     c.push("");
 
     // record structs
