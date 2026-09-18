@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { $ } from "bun";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadBoard } from "../compiler/boards.ts";
@@ -10,6 +10,9 @@ import { compileVaporApp, VAPOR_TARGETS, VaporCompileError } from "../compiler/c
 import { esp32BuildId } from "../compiler/esp32.ts";
 import { FONT8 } from "../compiler/font.gen.ts";
 import { buildRom } from "../compiler/rom.ts";
+
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+const HOST_INPUT = join(import.meta.dir, "..", "host", "input.ts");
 
 const ENTRY = join(import.meta.dir, "..", "examples", "todo", "todo.tsx");
 const TODO_SOURCE = await Bun.file(ENTRY).text();
@@ -1194,3 +1197,341 @@ export default () => {
     }
   }, 60000);
 });
+
+// Local const modules: `import { X } from "./levels.ts"` — the S2 hard
+// dependency so sokoban.tsx / sokoban.playdate.tsx share level data and
+// helpers without copy/paste (fleet tasks 966 §G8, 967 §3.3).
+describe("local const module imports", () => {
+  // A minimal legal local module: exported consts (number/string/string[]),
+  // a closed interface, and subset helpers (number params, void — same rules
+  // as in-file setup helpers until pure-returning helpers land).
+  const LEVELS_TS = `
+export const BW = 10;
+export const GREETING = "SOKOBAN";
+export const ROWS = ["####", "#@$.#", "####"];
+export interface Cell { k: number; wall: boolean }
+export function mark(d: number) { forStep(d); }
+export function forStep(d: number) { if (d === 0) { return; } return; }
+`;
+
+  const APP_TSX = () => `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { BW, GREETING, ROWS, mark } from "./levels.ts";
+export default () => {
+  const count = ref(0);
+  onButton((b) => {
+    if (b === Button.A) mark(count.value);
+    if (b === Button.B) count.value = GREETING.length;
+  });
+  return (
+    <>
+      <row y={0}>{ROWS[count.value]}</row>
+      <row y={1}>{GREETING}{BW}{ROWS.length}</row>
+    </>
+  );
+};
+`;
+
+  interface Proj { dir: string; entry: string }
+  async function makeProject(files: Record<string, string>): Promise<Proj> {
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-import-"));
+    for (const [name, content] of Object.entries(files)) await writeFile(join(dir, name), content);
+    return { dir, entry: join(dir, "app.tsx") };
+  }
+
+  async function compileProject(files: Record<string, string>, target: Parameters<typeof compileVaporApp>[3] = "gba") {
+    const proj = await makeProject(files);
+    try {
+      return compileVaporApp(proj.entry, await Bun.file(proj.entry).text(), "IMPORT", target);
+    } finally {
+      // caller decides when to clean; kept for the test duration below
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  }
+
+  test("folds cross-file number/string/string[] consts and emits module helpers", async () => {
+    const app = await compileProject({ "levels.ts": LEVELS_TS, "app.tsx": APP_TSX() });
+    // number const folds to literal
+    expect(app.c).toContain("vp_ln_int(10)");
+    // string[].length folds across files
+    expect(app.c).toContain("vp_ln_int(3)");
+    // helpers from the imported module compile to real C functions with a
+    // module-prefixed name, and call each other
+    expect(app.c).toContain("static void fn_m0_mark(s32 p_d)");
+    expect(app.c).toContain("static void fn_m0_forStep(s32 p_d)");
+    expect(app.c).toContain("fn_m0_forStep(p_d);");
+    expect(app.c).toContain("fn_m0_mark(g_count)");
+    // string[] const folds to a ROM pointer table named after the module const
+    expect(app.c).toMatch(/static const char \*const A_m0_ROWS\[3\]/);
+    // the imported string itself is in ROM
+    expect(app.c).toContain('static const char S0[] = "SOKOBAN";');
+    // the imported closed interface becomes a record typedef
+    expect(app.c).toContain("typedef struct { s32 k; u8 wall; } rec_cell;");
+  });
+
+  test("per-target SCREEN-style folds still resolve across modules", async () => {
+    // BW is used identically regardless of target; smoke-check gb + nes parse
+    const gb = await compileProject({ "levels.ts": LEVELS_TS, "app.tsx": APP_TSX() }, "gb");
+    const nes = await compileProject({ "levels.ts": LEVELS_TS, "app.tsx": APP_TSX() }, "nes");
+    expect(gb.c).toContain("/* target: gb (20x18) */");
+    expect(nes.c).toContain("/* target: nes (22x18) */");
+  });
+
+  test("rejects a module containing a ref", async () => {
+    const bad = `
+import { ref } from "vue";
+export const n = ref(0);
+`;
+    let msg = "";
+    const proj = await makeProject({ "levels.ts": bad, "app.tsx": APP_TSX() });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/levels\.ts:\d+:\d+/);
+      expect(msg).toContain("vue");
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a module with side effects", async () => {
+    const bad = `
+export const BW = 10;
+BW + 1;
+`;
+    let msg = "";
+    const proj = await makeProject({ "levels.ts": bad, "app.tsx": APP_TSX() });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/levels\.ts:\d+:\d+/);
+      expect(msg).toMatch(/may only contain export const/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects circular imports", async () => {
+    const a = `export const A = 1;`;
+    // b imports c and c imports b — cycle
+    const b = `import { C } from "./c.ts";\nexport const B = C;`;
+    const c = `import { B } from "./b.ts";\nexport const C = B + 1;`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { B } from "./b.ts";
+export default () => {
+  const count = ref(0);
+  onButton((bb) => { if (bb === Button.A) count.value = B; });
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "a.ts": a, "b.ts": b, "c.ts": c, "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/circular import/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects non-relative import sources", async () => {
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { levels } from "levels";
+export default () => {
+  const count = ref(0);
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    const msg = (() => {
+      try {
+        compileVaporApp("app.tsx", app);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      throw new Error("expected error");
+    })();
+    expect(msg).toMatch(/local imports must use a relative path/);
+  });
+
+  test("resolves extensionless relative imports to .ts", async () => {
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { BW } from "./levels";
+export default () => {
+  const count = ref(0);
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}{BW}</row></>);
+};
+`;
+    const compiled = await compileProject({ "levels.ts": LEVELS_TS, "app.tsx": app });
+    expect(compiled.c).toContain("vp_ln_int(10)");
+  });
+
+  test("rejects a local module that is not a .ts/.tsx file", async () => {
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { BW } from "./data.txt";
+export default () => {
+  const count = ref(0);
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "data.txt": "export const BW = 10;", "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/must be a \.ts file/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a module helper that returns a value", async () => {
+    const bad = `
+export const BW = 10;
+export function add(a: number, b: number): number { return a + b + BW; }
+`;
+    let msg = "";
+    const proj = await makeProject({ "levels.ts": bad, "app.tsx": APP_TSX() });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/levels\.ts:\d+:\d+.*cannot return values/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a module that imports vue", async () => {
+    const bad = `import { ref } from "vue";\nexport const n = 1;\n`;
+    let msg = "";
+    const proj = await makeProject({ "levels.ts": bad, "app.tsx": APP_TSX() });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/levels\.ts:1:\d+/);
+      expect(msg).toContain("vue");
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("follows a chain of local module imports", async () => {
+    const base = `export const BASE = 100;\nexport function bump(d: number) { if (d === BASE) { return; } }`;
+    const mid = `
+import { BASE, bump } from "./base.ts";
+export const MID = BASE + 1;
+export function go(d: number) { bump(d + MID); }
+`;
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { MID, go } from "./mid.ts";
+export default () => {
+  const count = ref(0);
+  onButton((b) => { if (b === Button.A) go(count.value); });
+  return (<><row y={0}>{MID}</row></>);
+};
+`;
+    const compiled = await compileProject({ "base.ts": base, "mid.ts": mid, "app.tsx": app });
+    expect(compiled.c).toContain("vp_ln_int(101)");
+    // mid is loaded first (idx 0), its transitive base second (idx 1); the
+    // helper from mid is emitted and calls through into base's helper
+    expect(compiled.c).toContain("static void fn_m0_go(s32 p_d)");
+    expect(compiled.c).toContain("fn_m1_bump(");
+  });
+
+  test("rejects importing a name the module does not export", async () => {
+    const app = APP_TUX_MISSING();
+    let msg = "";
+    const proj = await makeProject({ "levels.ts": LEVELS_TS, "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/does not export/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("diagnostics carry imported file line:col", async () => {
+    const bad = `export const N = 1;\nsideEffect();\n`;
+    const proj = await makeProject({
+      "levels.ts": bad,
+      "app.tsx": `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { N } from "./levels.ts";
+export default () => {
+  const count = ref(N);
+  onButton((b) => {});
+  return (<><row y={0}>{count.value}</row></>);
+};
+`,
+    });
+    let msg = "";
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/levels\.ts:2:\d+/);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+function APP_TUX_MISSING(): string {
+  return `
+import { ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+import { nope } from "./levels.ts";
+export default () => {
+  const count = ref(0);
+  onButton((b) => { if (b === Button.A) count.value = nope; });
+  return (<><row y={0}>{count.value}</row></>);
+};
+`;
+}

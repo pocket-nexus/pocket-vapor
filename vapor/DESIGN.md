@@ -182,6 +182,16 @@ Enforced with diagnostics, not documentation. In:
     Treat an out-of-range index as outside the subset and guard it at the
     call site: `x < line.text.length ? line.text[x] : CH[empty]`. The
     Sokoban board never depends on the space sentinel.
+- **Local const modules**: `import { X, Y } from "./levels.ts"` pulls in a
+  relative-path module that may only declare `export const` literals
+  (number / string / string[] / `{name: number}`), closed `export interface`s,
+  and `export function` subset helpers (number params, void). No `vue`/host
+  imports, refs, JSX, or side effects — violations carry file:line:col from
+  the imported file, and circular imports are rejected. Module consts fold
+  exactly like in-file consts; module helpers compile to C functions in the
+  same translation unit. Each root component is compiled independently
+  (no link-time sharing), so the same module imported by `app.tsx` and
+  `app.playdate.tsx` is folded twice, once per target build.
 - **Whole-list assignment**: `todos.value = todos.value.filter(...)` —
   views over one list always carry increasing pool indices, so the
   compiler emits an in-place compaction; new-array identity always

@@ -17,6 +17,8 @@
 // arms), which can only cause redundant repaints, never a missed one.
 
 import ts from "typescript";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { FONT8 } from "./font.gen.ts";
 import { sccpRefConstants } from "./sccp.ts";
 import { rgb555, rgb565, StyleTable, type StyleIssue } from "./styles.ts";
@@ -138,6 +140,10 @@ interface ComputedBinding {
 interface FnBinding {
   kind: "fn";
   name: string;
+  /** emitted C function name; in-file helpers are `fn_<name>`, helpers from
+   * imported local modules are `fn_m<idx>_<name>` (collision-free across
+   * modules, since two modules may export the same local name). */
+  cName: string;
   decl: ts.FunctionDeclaration;
   emitted: boolean;
   deps: Set<string>;
@@ -152,11 +158,17 @@ interface FnBinding {
    * splice, or an indirect (element-access) call such as keymap dispatch */
   writeNode: ts.Node | null;
   hasValueReturn: boolean;
+  /** For helpers imported from a local const module: that module's captured
+   * scope, reinstalled while the helper is emitted. */
+  moduleScope?: Map<string, Binding>;
 }
 
 interface ConstBinding {
   kind: "const";
   name: string;
+  /** unique C-side key for emitted tables (in-file: the name itself; module
+   * consts: `m<idx>_<name>` so same-named exports never collide). */
+  cName: string;
   value: number | string | string[] | Record<string, number>;
 }
 
@@ -284,6 +296,15 @@ class AppCompiler {
   private styleTable = new StyleTable();
   private styleErrors: string[] = [];
   private styleWarnings: string[] = [];
+
+  // ---- local const module loading ------------------------------------------
+  // `import { X } from "./levels.ts"` pulls in a module that may only declare
+  // `export const` literals, closed `export interface`s, and subset helper
+  // `export function`s (number params). No vue/host imports, no refs, no JSX,
+  // no side effects. Modules are compiled into the same translation unit;
+  // each root component is compiled independently (sokoban.tsx and
+  // sokoban.playdate.tsx get separate compilations, no link-time sharing).
+  private moduleStack: string[] = []; // resolved paths being scanned (cycle guard)
 
   /** SCCP result: refs proven constant (name -> value). Reads of these fold
    * through constNum, so they never register dependencies and decidable
@@ -458,7 +479,7 @@ class AppCompiler {
   }
 
   private err(node: ts.Node, message: string): never {
-    throw new VaporCompileError(this.sf, node, message);
+    throw new VaporCompileError(node.getSourceFile(), node, message);
   }
 
   // ---- module scan ---------------------------------------------------------
@@ -466,7 +487,7 @@ class AppCompiler {
   compile(): CompiledApp {
     let component: ts.ArrowFunction | null = null;
     for (const stmt of this.sf.statements) {
-      if (ts.isImportDeclaration(stmt)) this.scanImport(stmt);
+      if (ts.isImportDeclaration(stmt)) this.scanImport(stmt, this.sf, dirname(this.sf.fileName));
       else if (ts.isInterfaceDeclaration(stmt)) this.scanInterface(stmt);
       else if (ts.isTypeAliasDeclaration(stmt)) continue; // types are erased
       else if (ts.isFunctionDeclaration(stmt)) this.scanComponent(stmt);
@@ -490,48 +511,301 @@ class AppCompiler {
     return this.emit();
   }
 
-  private scanImport(stmt: ts.ImportDeclaration): void {
+  private scanImport(stmt: ts.ImportDeclaration, sf: ts.SourceFile, baseDir: string, inModule = false): void {
     const from = (stmt.moduleSpecifier as ts.StringLiteral).text;
     const bindings = stmt.importClause?.namedBindings;
     if (!bindings || !ts.isNamedImports(bindings)) this.err(stmt, "only named imports are supported");
-    for (const spec of bindings.elements) {
-      const imported = (spec.propertyName ?? spec.name).text;
-      const local = spec.name.text;
-      if (from === "vue") {
+    if (from === "vue") {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "vue" — they can only declare const data, interfaces, and pure-subset helpers`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        const local = spec.name.text;
         if (imported === "ref") this.vueRef = local;
         else if (imported === "computed") this.vueComputed = local;
         else this.err(spec, `unsupported vue import: ${imported} (subset allows ref, computed)`);
-      } else if (/\/host\/input(\.ts)?$/.test(from)) {
-        if (imported === "onButton") this.hostOnButton = local;
-        else if (imported === "Button") this.hostButton = local;
-        else if (imported === "onAxisDelta") this.hostOnAxisDelta = local;
-        else if (imported === "RelativeAxis")
+      }
+      return;
+    }
+    if (/\/host\/input(\.ts)?$/.test(from) || /\/host\/screen(\.ts)?$/.test(from)) {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "${from}" — host APIs belong to the component, not the data module`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        const local = spec.name.text;
+        if (/\/host\/input(\.ts)?$/.test(from)) {
+          if (imported === "onButton") this.hostOnButton = local;
+          else if (imported === "Button") this.hostButton = local;
+          else if (imported === "onAxisDelta") this.hostOnAxisDelta = local;
+          else if (imported === "RelativeAxis")
+            this.scope.set(local, { kind: "const", cName: local, name: local, value: { Primary: 0, Secondary: 1 } });
+          else if (imported === "RelativeAxisUnits")
+            this.scope.set(local, {
+              kind: "const",
+              cName: local,
+              name: local,
+              value: { PerDegree: 1000, PerTurn: 360000 },
+            });
+          else this.err(spec, `unsupported host import: ${imported}`);
+        } else {
+          if (imported !== "SCREEN") this.err(spec, `unsupported host import: ${imported}`);
           this.scope.set(local, {
             kind: "const",
+            cName: local,
             name: local,
-            value: { Primary: 0, Secondary: 1 },
+            value: { width: this.target.width, height: this.target.height },
           });
-        else if (imported === "RelativeAxisUnits")
-          this.scope.set(local, {
-            kind: "const",
-            name: local,
-            value: { PerDegree: 1000, PerTurn: 360000 },
-          });
+        }
+      }
+      return;
+    }
+    if (/\/host\/text(\.ts)?$/.test(from)) {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "${from}" — host APIs belong to the component, not the data module`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        if (imported === "putChar") this.hostPutChar = spec.name.text;
         else this.err(spec, `unsupported host import: ${imported}`);
-      } else if (/\/host\/screen(\.ts)?$/.test(from)) {
-        if (imported !== "SCREEN") this.err(spec, `unsupported host import: ${imported}`);
-        this.scope.set(local, {
-          kind: "const",
-          name: local,
-          value: { width: this.target.width, height: this.target.height },
-        });
-      } else if (/\/host\/text(\.ts)?$/.test(from)) {
-        if (imported === "putChar") this.hostPutChar = local;
+      }
+      return;
+    }
+    if (/\/host\/list(\.ts)?$/.test(from)) {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "${from}" — host APIs belong to the component, not the data module`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        if (imported === "withCapacity") this.hostWithCapacity = spec.name.text;
         else this.err(spec, `unsupported host import: ${imported}`);
-      } else if (/\/host\/list(\.ts)?$/.test(from)) {
-        if (imported === "withCapacity") this.hostWithCapacity = local;
-        else this.err(spec, `unsupported host import: ${imported}`);
-      } else this.err(stmt, `unsupported import source: ${from}`);
+      }
+      return;
+    }
+    if (!from.startsWith("./") && !from.startsWith("../"))
+      this.err(
+        stmt.moduleSpecifier,
+        `unsupported import source: ${from} (local imports must use a relative path like "./levels.ts")`,
+      );
+    // Local const module: load (recursively) and bind the requested exports.
+    const mod = this.loadModule(from, stmt, baseDir);
+    for (const spec of bindings.elements) {
+      const imported = (spec.propertyName ?? spec.name).text;
+      const binding = mod.exports.get(imported);
+      if (!binding) this.err(spec, `module "${from}" does not export ${imported}`);
+      // interfaces are erased types: nothing to bind at runtime
+      if (binding === "interface") continue;
+      this.scope.set(spec.name.text, binding);
+    }
+  }
+
+  private moduleCount = 0;
+
+  private resolveModulePath(from: string, node: ts.Node, baseDir: string): string {
+    let path = resolve(baseDir, from);
+    if (!existsSync(path)) {
+      if (existsSync(path + ".ts")) path += ".ts";
+      else this.err(node, `cannot find local module "${from}"`);
+    }
+    if (!/\.(ts|tsx)$/.test(path))
+      this.err(node, `local module "${from}" must be a .ts file`);
+    return path;
+  }
+
+  /** Loaded module record. `scope` is the module's own binding environment,
+   * captured at scan time; when one of its helpers is emitted/validated it is
+   * layered on top of the component scope, so a module helper has the same
+   * powers as an in-file helper (reads/writes of component refs) while its
+   * own consts and sibling helpers take precedence. */
+  private moduleRecords = new Map<
+    string,
+    {
+      exports: Map<string, Binding | "interface">;
+      interfaces: Set<string>;
+      scope: Map<string, Binding>;
+      helpers: FnBinding[];
+    }
+  >();
+
+  private loadModule(
+    from: string,
+    importNode: ts.ImportDeclaration,
+    baseDir: string,
+  ): {
+    exports: Map<string, Binding | "interface">;
+    interfaces: Set<string>;
+    scope: Map<string, Binding>;
+    helpers: FnBinding[];
+  } {
+    const path = this.resolveModulePath(from, importNode.moduleSpecifier, baseDir);
+    const cached = this.moduleRecords.get(path);
+    if (cached) return cached;
+    if (this.moduleStack.includes(path))
+      this.err(
+        importNode.moduleSpecifier,
+        `circular import detected: ${[...this.moduleStack.slice(this.moduleStack.indexOf(path)), path]
+          .map((pp) => pp.replace(/^.*\//, ""))
+          .join(" -> ")}`,
+      );
+    let text: string;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      this.err(importNode.moduleSpecifier, `cannot read local module "${from}"`);
+    }
+    const modSf = ts.createSourceFile(path, text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS);
+    const idx = this.moduleCount++;
+    this.moduleStack.push(path);
+    const savedScope = this.scope;
+    const modScope = new Map<string, Binding>();
+    this.scope = modScope;
+    const exports = new Map<string, Binding | "interface">();
+    const interfaces = new Set<string>();
+    const helpers: FnBinding[] = [];
+    try {
+      for (const stmt of modSf.statements) {
+        if (ts.isImportDeclaration(stmt)) {
+          // Modules may only pull in other local const modules — never vue/host.
+          this.scanImport(stmt, modSf, dirname(path), true);
+          continue;
+        }
+        const isExported =
+          ts.canHaveModifiers(stmt) &&
+          !!ts.getModifiers(stmt)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+        if (ts.isInterfaceDeclaration(stmt)) {
+          if (!isExported)
+            this.err(stmt, "imported modules may only contain `export interface` declarations");
+          this.scanInterface(stmt);
+          exports.set(stmt.name.text, "interface");
+          continue;
+        }
+        if (ts.isFunctionDeclaration(stmt)) {
+          if (!isExported || !stmt.name)
+            this.err(
+              stmt,
+              "imported modules may only export subset helpers (`export function name(d: number)`) — no inner functions",
+            );
+          const binding = this.scanModuleFunction(stmt, modSf, idx);
+          helpers.push(binding);
+          exports.set(stmt.name.text, binding);
+          continue;
+        }
+        if (ts.isVariableStatement(stmt)) {
+          if (!isExported)
+            this.err(
+              stmt,
+              "imported modules may only export `export const` data (number, string, string[], {name: number})",
+            );
+          for (const name of this.scanModuleConst(stmt, modSf, idx))
+            exports.set(name, modScope.get(name)!);
+          continue;
+        }
+        this.err(
+          stmt,
+          `imported modules may only contain export const, export interface, and export function declarations — got ${ts.SyntaxKind[stmt.kind]}`,
+        );
+      }
+    } finally {
+      this.scope = savedScope;
+      this.moduleStack.pop();
+    }
+    const record = { exports, interfaces, scope: modScope, helpers };
+    this.moduleRecords.set(path, record);
+    // Bodies validate after every declaration is in the module scope so
+    // helpers may call each other in any order (function hoisting semantics).
+    for (const binding of helpers) this.validateModuleHelper(binding);
+    return record;
+  }
+
+  private scanModuleFunction(decl: ts.FunctionDeclaration, sf: ts.SourceFile, modIdx: number): FnBinding {
+    const params = decl.parameters.map((p) => {
+      if (!ts.isIdentifier(p.name)) this.err(p, "helper params must be simple names");
+      if (!p.type || p.type.getText(sf) !== "number")
+        this.err(p, "helper params must be annotated `: number`");
+      return p.name.text;
+    });
+    if (!decl.body || !ts.isBlock(decl.body)) this.err(decl, "helpers need a block body");
+    if (decl.typeParameters) this.err(decl, "helpers may not be generic");
+    if (decl.type && decl.type.getText(sf) !== "void")
+      this.err(decl.type, "imported module helpers cannot return values yet (void subset; pure number-returning helpers are a separate extension)");
+    const binding: FnBinding = {
+      kind: "fn",
+      name: decl.name!.text,
+      cName: `fn_m${modIdx}_${decl.name!.text}`,
+      decl,
+      emitted: false,
+      deps: new Set(),
+      params,
+      paramTys: params.map(() => "num" as const),
+      result: "void",
+      callees: [],
+      writeNode: null,
+      hasValueReturn: false,
+      moduleScope: this.scope,
+    };
+    if (this.scope.has(decl.name!.text)) this.err(decl, `duplicate declaration of ${decl.name!.text} in module`);
+    this.scope.set(decl.name!.text, binding);
+    return binding;
+  }
+
+  /** Validate an imported-module helper by compiling its body through the
+   * real statement/expression pipeline with emission state snapshotted and
+   * rolled back: the dry run proves the body is in the void-helper subset
+   * (file:line:col diagnostics from the module's own source file) without
+   * emitting any C or interned strings. Keymaps/JSX/refs are impossible in a
+   * module scope and the normal compile paths reject them. */
+  private validateModuleHelper(b: FnBinding): void {
+    const modScope = b.moduleScope!;
+    const savedScope = this.scope;
+    const savedCurDeps = this.curDeps;
+    const savedHoist = this.hoist;
+    const savedBodiesLen = this.bodies.length;
+    const savedDeclsLen = this.decls.length;
+    const savedStrLits = new Map(this.strLits);
+    const savedStrArrays = new Map(this.strArrays);
+    const savedTmpCounter = this.tmpCounter;
+    const savedOvlTempsLen = this.ovlTemps.length;
+    const savedOvlEdges = new Map([...this.ovlEdges].map(([k, v]) => [k, new Set(v)]));
+    const flipped: FnBinding[] = [];
+    const markEmitted = (): void => {
+      for (const rec of this.moduleRecords.values())
+        for (const binding of rec.scope.values())
+          if (binding.kind === "fn" && binding.emitted) flipped.push(binding);
+    };
+    markEmitted();
+    const wasEmitted = new Set(flipped);
+    this.curDeps = b.deps;
+    this.scope = new Map(modScope);
+    try {
+      for (const p of b.params) this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: NUM });
+      this.withOwner(b.cName, () =>
+        this.withHoist((out) => {
+          for (const stmt of b.decl.body!.statements) this.compileStmt(stmt, out, "  ");
+        }),
+      );
+    } finally {
+      this.bodies.length = savedBodiesLen;
+      this.decls.length = savedDeclsLen;
+      this.strLits = savedStrLits;
+      this.strArrays = savedStrArrays;
+      this.tmpCounter = savedTmpCounter;
+      this.ovlTemps.length = savedOvlTempsLen;
+      this.ovlEdges = savedOvlEdges;
+      for (const rec of this.moduleRecords.values())
+        for (const binding of rec.scope.values())
+          if (binding.kind === "fn" && binding.emitted && !wasEmitted.has(binding)) binding.emitted = false;
+      this.scope = savedScope;
+      this.curDeps = savedCurDeps;
+      this.hoist = savedHoist;
     }
   }
 
@@ -540,7 +814,7 @@ class AppCompiler {
     for (const member of decl.members) {
       if (!ts.isPropertySignature(member) || !member.type || !ts.isIdentifier(member.name))
         this.err(member, "interface members must be `name: type`");
-      const tyText = member.type.getText(this.sf);
+      const tyText = member.type.getText();
       if (tyText !== "string" && tyText !== "boolean" && tyText !== "number")
         this.err(member.type, `interface field type must be string | boolean | number, got ${tyText}`);
       fields.push({
@@ -551,33 +825,53 @@ class AppCompiler {
     this.ifaces.set(decl.name.text, { name: decl.name.text, fields });
   }
 
-  private scanModuleConst(stmt: ts.VariableStatement): void {
-    if (!(stmt.declarationList.flags & ts.NodeFlags.Const)) this.err(stmt, "module variables must be const");
+  private scanModuleConst(
+    stmt: ts.VariableStatement,
+    sf: ts.SourceFile = this.sf,
+    modIdx = -1,
+  ): string[] {
+    if (!(stmt.declarationList.flags & ts.NodeFlags.Const))
+      throw new VaporCompileError(sf, stmt, "module variables must be const");
+    const names: string[] = [];
     for (const decl of stmt.declarationList.declarations) {
-      if (!ts.isIdentifier(decl.name) || !decl.initializer) this.err(decl, "const needs a simple name + initializer");
+      if (!ts.isIdentifier(decl.name) || !decl.initializer)
+        throw new VaporCompileError(sf, decl, "const needs a simple name + initializer");
       const name = decl.name.text;
+      const cName = modIdx >= 0 ? `m${modIdx}_${name}` : name;
       const init = decl.initializer;
+      const put = (value: ConstBinding["value"]): void => {
+        this.scope.set(name, { kind: "const", name: cName, cName, value });
+        names.push(name);
+      };
       const folded = this.constNum(init) ?? this.constBool(init);
-      if (folded !== null) this.scope.set(name, { kind: "const", name, value: folded });
-      else if (ts.isStringLiteral(init)) this.scope.set(name, { kind: "const", name, value: init.text });
+      if (folded !== null) put(folded);
+      else if (ts.isStringLiteral(init)) put(init.text);
       else if (ts.isArrayLiteralExpression(init)) {
         const items = init.elements.map((el) => {
-          if (!ts.isStringLiteral(el)) this.err(el, "const arrays must contain string literals");
+          if (!ts.isStringLiteral(el))
+            throw new VaporCompileError(sf, el, "const arrays must contain string literals");
           return el.text;
         });
-        this.scope.set(name, { kind: "const", name, value: items });
+        put(items);
       } else if (ts.isObjectLiteralExpression(init)) {
         const record: Record<string, number> = {};
         for (const prop of init.properties) {
           if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name))
-            this.err(prop, "const objects must use `name: number` members");
+            throw new VaporCompileError(sf, prop, "const objects must use `name: number` members");
           const v = this.constNum(prop.initializer);
-          if (v === null) this.err(prop.initializer, "const object members must be compile-time numbers");
+          if (v === null)
+            throw new VaporCompileError(sf, prop.initializer, "const object members must be compile-time numbers");
           record[prop.name.text] = v;
         }
-        this.scope.set(name, { kind: "const", name, value: record });
-      } else this.err(init, "module consts must be number, string, string[], or {name: number} literals");
+        put(record);
+      } else
+        throw new VaporCompileError(
+          sf,
+          init,
+          "module consts must be number, string, string[], or {name: number} literals",
+        );
     }
+    return names;
   }
 
   // ---- setup scan ----------------------------------------------------------
@@ -658,6 +952,7 @@ class AppCompiler {
         const binding: FnBinding = {
           kind: "fn",
           name: stmt.name.text,
+          cName: `fn_${stmt.name.text}`,
           decl: stmt,
           emitted: false,
           deps: new Set(),
@@ -983,7 +1278,7 @@ class AppCompiler {
         if (b.result === "num")
           this.err(value, `keymap action '${b.name}' cannot return a value; use a void helper`);
         this.emitFn(b);
-        entries.set(key, `fn_${b.name}`);
+        entries.set(key, b.cName);
       } else this.err(pa.initializer, "keymap values must be arrows or setup functions");
     }
     const binding: KeymapBinding = { kind: "keymap", name, entries };
@@ -1668,8 +1963,8 @@ class AppCompiler {
         });
         this.emitFn(b);
         for (const d of b.deps) this.depRef(d);
-        this.ovlCall(`fn_${b.name}`);
-        return { c: `fn_${b.name}(${args.join(", ")})`, ty: b.result === "num" ? NUM : { k: "void" } };
+        this.ovlCall(b.cName);
+        return { c: `${b.cName}(${args.join(", ")})`, ty: b.result === "num" ? NUM : { k: "void" } };
       }
     }
     this.err(e, "unsupported call");
@@ -2178,7 +2473,10 @@ class AppCompiler {
     const prevResult = this.curFnResult;
     this.curFnResult = b.result;
     const saved = new Map(this.scope);
-    const { decls, body } = this.withOwner(`fn_${b.name}`, () => this.withHoist((out) => {
+    // An imported-module helper compiles against its own module's scope
+    // (its consts, interfaces, and sibling helpers), not the component scope.
+    if (b.moduleScope) this.scope = new Map(b.moduleScope);
+    const { decls, body } = this.withOwner(b.cName, () => this.withHoist((out) => {
       b.params.forEach((p, i) =>
         this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: b.paramTys[i] === "bool" ? BOOL : NUM }),
       );
@@ -2189,7 +2487,7 @@ class AppCompiler {
     this.curDeps = prevDeps;
     const sig = b.params.length ? b.params.map((p) => `s32 p_${p}`).join(", ") : "void";
     const ret = b.result === "num" ? "s32" : "void";
-    this.bodies.push(`static ${ret} fn_${b.name}(${sig}) {\n${[...decls, ...body].join("\n")}\n}\n`);
+    this.bodies.push(`static ${ret} ${b.cName}(${sig}) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
 
   // ---- JSX -> effects -------------------------------------------------------

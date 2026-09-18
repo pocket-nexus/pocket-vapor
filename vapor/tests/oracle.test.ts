@@ -6,6 +6,8 @@
 // .gba and compares grids cell-for-cell.
 
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compileVaporApp } from "../compiler/compile.ts";
 import { Button } from "../host/input.ts";
@@ -287,5 +289,90 @@ describe("pure number helper fixture under real Vue Vapor", () => {
     expect(row0(o)).toBe("S 7".padEnd(30)); // 2+2+3
     expect(row1(o)).toBe("I 0 V 2 T 7".padEnd(30));
     o.unmount();
+  });
+});
+
+// Cross-file const module imports behave identically under the real Vue
+// Vapor oracle: the local `./levels.ts` is an ordinary TS module on the
+// oracle side, and the AOT compiler folds the same consts (fleet task 1002).
+describe("local const module import under the real Vue oracle", () => {
+  const LEVELS_TS = `
+export const BW = 10;
+export const ROWS = ["####", "#@$.#", "####"];
+// void subset helper: same rules as an in-file helper
+export function noop(d: number) { if (d < 0) { return; } }
+`;
+
+  const APP_TSX = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${join(import.meta.dir, "..", "host", "input.ts")}";
+import { BW, ROWS, noop } from "./levels.ts";
+export default () => {
+  const count = ref(0);
+  onButton((b) => {
+    if (b === Button.A) { count.value = count.value + 1; noop(count.value); }
+    if (b === Button.B) count.value = 0;
+  });
+  return (
+    <>
+      <row y={0}>{ROWS[count.value % ROWS.length]}</row>
+      <row y={1}>BW={BW} N={ROWS.length}</row>
+    </>
+  );
+};
+`;
+
+  const HOST = join(import.meta.dir, "..", "host", "input.ts");
+
+  const ENTRY_TS = `
+import { createVaporApp, nextTick } from "vue";
+import App from "./app.tsx";
+import { __dispatchButton, __resetButtons } from "${HOST}";
+const hooks = globalThis as Record<string, unknown>;
+hooks.__vaporBoot = (container: unknown) => {
+  __resetButtons();
+  const app = (createVaporApp as unknown as (c: unknown) => { mount(c: unknown): void; unmount(): void })({
+    setup: () => (App as () => unknown)(),
+  });
+  app.mount(container);
+  return app;
+};
+hooks.__vaporPress = (button: number): void => { __dispatchButton(button); };
+hooks.__vaporAxisDelta = (): void => {};
+hooks.__vaporTick = (): Promise<void> => nextTick();
+`;
+
+  async function bootImportOracle(): Promise<{ o: Oracle; cleanup: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-oracle-import-"));
+    await writeFile(join(dir, "levels.ts"), LEVELS_TS);
+    await writeFile(join(dir, "app.tsx"), APP_TSX);
+    await writeFile(join(dir, "entry.ts"), ENTRY_TS);
+    // compile the same app through the AOT frontend: it must accept it and
+    // fold BW/ROWS.length exactly like the oracle renders them
+    const compiled = compileVaporApp(join(dir, "app.tsx"), APP_TSX, "IMPORT", "gba");
+    expect(compiled.c).toContain("vp_ln_int(10)");
+    expect(compiled.c).toContain("vp_ln_int(3)");
+    expect(compiled.c).toContain("static void fn_m0_noop(s32 p_d)");
+    const o = await bootOracle({ width: 30, height: 20, styles: compiled.styles, entry: join(dir, "entry.ts") });
+    return { o, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  }
+
+  test("cross-file string[] index, .length and number const render like the AOT folds", async () => {
+    const { o, cleanup } = await bootImportOracle();
+    try {
+      expect(o.grid().chars[0]).toBe("####".padEnd(30));
+      expect(o.grid().chars[1]).toBe("BW=10 N=3".padEnd(30));
+      await o.press(Button.A); // count 0 -> 1
+      expect(o.grid().chars[0]).toBe("#@$.#".padEnd(30));
+      await o.press(Button.A); // count 1 -> 2
+      expect(o.grid().chars[0]).toBe("####".padEnd(30));
+      await o.press(Button.A); // wraps 3 % 3 -> 0
+      expect(o.grid().chars[0]).toBe("####".padEnd(30));
+      await o.press(Button.B); // reset
+      expect(o.grid().chars[0]).toBe("####".padEnd(30));
+      o.unmount();
+    } finally {
+      await cleanup();
+    }
   });
 });
