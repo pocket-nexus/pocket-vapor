@@ -101,7 +101,7 @@ type Ty =
   | { k: "char" }
   | { k: "strlit" } // C `const char *`
   | { k: "sb" } // C `const vp_sb *`
-  | { k: "obj"; iface: string; listRef: string } // nullable record pointer
+  | { k: "obj"; iface: string; listRef: string; nullable: boolean } // record pointer (nullable when from a pool index)
   | { k: "view"; iface: string; listRef: string; maxLen: number; cap: number }
   | { k: "void" };
 
@@ -1238,7 +1238,7 @@ class AppCompiler {
         out.push(`${ind}  for (${i} = 0; ${i} < ${src.len}; ${i}++) {`);
         out.push(`${ind}    rec_${iface.toLowerCase()} *${p} = g_${listRef} + (u16)(${src.at(i)});`);
         const saved = new Map(this.scope);
-        this.scope.set(param, { kind: "local", cName: p, ty: { k: "obj", iface, listRef } });
+        this.scope.set(param, { kind: "local", cName: p, ty: { k: "obj", iface, listRef, nullable: false } });
         const pred = this.compileExpr(arrow.body, out, ind + "    ");
         this.scope = saved;
         out.push(`${ind}    if (${this.condition(pred)}) ${target}.idx[${target}.len++] = ${src.at(i)};`);
@@ -1448,7 +1448,7 @@ class AppCompiler {
       out.push(
         `${ind}${p} = (${idx.c} >= 0 && ${idx.c} < (s32)${src.len}) ? g_${listRef} + (u16)(${src.at(`(u8)(${idx.c})`)}) : 0;`,
       );
-      return { c: p, ty: { k: "obj", iface, listRef } };
+      return { c: p, ty: { k: "obj", iface, listRef, nullable: true } };
     }
 
     // record string field indexing: line.text[i] -> vp_sb_at (compileMember
@@ -1609,8 +1609,22 @@ class AppCompiler {
         return;
       }
       const cond = this.compileExpr(stmt.expression, out, ind);
+      // `if (t)` narrows a nullable record-pointer local to non-null inside
+      // the then branch: the idiomatic guard `const t = list.value[i]; if (t)
+      // t.f = ...` then needs no runtime null check of its own.
+      const guardName =
+        ts.isIdentifier(this.unparen(stmt.expression)) ? this.unparen(stmt.expression).getText(this.sf) : null;
+      const guardBinding = guardName ? this.scope.get(guardName) : undefined;
+      const narrowed =
+        guardBinding?.kind === "local" && guardBinding.ty.k === "obj" && guardBinding.ty.nullable;
       out.push(`${ind}if (${this.condition(cond)}) {`);
+      if (narrowed) {
+        const b = guardBinding as Extract<Binding, { kind: "local" }>;
+        const ty = b.ty as Extract<Ty, { k: "obj" }>;
+        this.scope.set(guardName!, { ...b, ty: { ...ty, nullable: false } });
+      }
       this.compileStmt(stmt.thenStatement, out, ind + "  ");
+      if (narrowed) this.scope.set(guardName!, guardBinding as Extract<Binding, { kind: "local" }>);
       if (stmt.elseStatement) {
         out.push(`${ind}} else {`);
         this.compileStmt(stmt.elseStatement, out, ind + "  ");
@@ -1812,8 +1826,21 @@ class AppCompiler {
       const iface = this.ifaces.get(obj.ty.iface)!;
       const field = iface.fields.find((f) => f.name === lhs.name.text);
       if (!field) this.err(lhs, `no field ${lhs.name.text} on ${obj.ty.iface}`);
+      // A pointer that came from a pool index can be null (index out of
+      // range): writing its fields dereferences address 0 and hangs the GBA.
+      // Reuse a simple local (`l_ln_1`); otherwise materialize the indexing
+      // expression once into a guarded temp. Non-nullable sources
+      // (map/filter locals, pushed records, or `if (t)`-narrowed pointers)
+      // keep the exact old code shape.
+      let ptr = obj.c;
+      if (obj.ty.nullable && !/^\w+$/.test(obj.c)) {
+        const gp = this.tmp("gw");
+        this.declare(`rec_${obj.ty.iface.toLowerCase()} *${gp};`);
+        out.push(`${ind}${gp} = ${obj.c};`);
+        ptr = gp;
+      }
       if (field.ty === "str") {
-        if (this.compilePutCharField(lhs, obj.c, obj.ty.listRef, rhs, out, ind)) return;
+        if (this.compilePutCharField(lhs, ptr, obj.ty.listRef, rhs, out, ind, obj.ty.nullable)) return;
         this.err(
           lhs,
           "string field writes only via push, or `t.s = putChar(t.s, i, ch)` for one byte",
@@ -1822,9 +1849,14 @@ class AppCompiler {
       const v = this.compileExpr(rhs, out, ind);
       const tmp = this.tmp("fv");
       const cast = field.ty === "bool" ? "(u8)" : "(s32)";
-      out.push(
-        `${ind}{ ${field.ty === "bool" ? "u8" : "s32"} ${tmp} = ${cast}(${this.truthy(v)}); if (${obj.c}->${lhs.name.text} != ${tmp}) { ${obj.c}->${lhs.name.text} = ${tmp}; ${this.markCode(obj.ty.listRef)}; } }`,
-      );
+      const write =
+        `{ ${field.ty === "bool" ? "u8" : "s32"} ${tmp} = ${cast}(${this.truthy(v)}); ` +
+        `if (${ptr}->${lhs.name.text} != ${tmp}) { ${ptr}->${lhs.name.text} = ${tmp}; ${this.markCode(obj.ty.listRef)}; } }`;
+      if (obj.ty.nullable) {
+        out.push(`${ind}if (!${ptr}) vp_tripwires |= VP_TRIP_NULL; else ${write}`);
+      } else {
+        out.push(`${ind}${write}`);
+      }
       return;
     }
     // line.text[i] = c: a silent no-op under real Vue (strings are immutable);
@@ -1849,6 +1881,7 @@ class AppCompiler {
     rhs: ts.Expression,
     out: string[],
     ind: string,
+    nullable = false,
   ): boolean {
     rhs = this.unparen(rhs);
     if (!ts.isCallExpression(rhs)) return false;
@@ -1886,9 +1919,9 @@ class AppCompiler {
     }
 
     this.usedSbPut = true;
-    out.push(
-      `${ind}if (vp_sb_put(&${recC}->${lhs.name.text}, ${idx.c}, ${ch.c})) ${this.markCode(listRef)};`,
-    );
+    const put = `if (vp_sb_put(&${recC}->${lhs.name.text}, ${idx.c}, ${ch.c})) ${this.markCode(listRef)};`;
+    if (nullable) out.push(`${ind}if (!${recC}) vp_tripwires |= VP_TRIP_NULL; else ${put}`);
+    else out.push(`${ind}${put}`);
     return true;
   }
 
@@ -2289,7 +2322,7 @@ class AppCompiler {
     body.push(`    rec_${iface.toLowerCase()} *${pV} = g_${listRef} + (u16)(${src.at(iV)});`);
 
     const saved = new Map(this.scope);
-    this.scope.set(itemParam, { kind: "local", cName: pV, ty: { k: "obj", iface, listRef } });
+    this.scope.set(itemParam, { kind: "local", cName: pV, ty: { k: "obj", iface, listRef, nullable: false } });
     this.scope.set(indexParam, { kind: "local", cName: `(s32)${iV}`, ty: NUM });
     const { src: rowSrc, ctx } = this.resolveRenderable(rowJsx);
     const prevCtx = this.propsCtx;

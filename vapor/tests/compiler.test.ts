@@ -488,6 +488,81 @@ export default () => {
   });
 });
 
+// F3 (reviewer 1094): a record pointer from a pool index expression is null
+// at runtime when the index is out of range. Field writes through it used to
+// dereference address 0 and hang the GBA; they now skip + trip VP_TRIP_NULL.
+describe("null record pointer write guards", () => {
+  test("unguarded putChar through an out-of-range pointer is null-guarded", () => {
+    const source = `${HEADER}
+import { putChar } from "../../host/text.ts";
+interface Line { text: string }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc" }]);
+  onButton((b) => {
+    const ln = rows.value[3];
+    ln.text = putChar(ln.text, 0, "Z");
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const app = compileVaporApp("n.tsx", source, "N", "gba");
+    expect(app.c).toMatch(
+      /if \(!l_ln_\d+\) vp_tripwires \|= VP_TRIP_NULL; else if \(vp_sb_put\(&l_ln_\d+->text, 0, 'Z'\)\) vp_mark\(0\);/,
+    );
+  });
+
+  test("unguarded number-field write through an out-of-range pointer is null-guarded", () => {
+    const source = `${HEADER}
+interface Line { text: string; n: number }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc", n: 1 }]);
+  onButton((b) => {
+    const ln = rows.value[3];
+    ln.n = 7;
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const app = compileVaporApp("n.tsx", source, "N", "gba");
+    expect(app.c).toContain("if (!l_ln_");
+    expect(app.c).toMatch(/if \(!l_ln_\d+\) vp_tripwires \|= VP_TRIP_NULL; else \{ s32 fv\d+ = \(s32\)\(7\);/);
+  });
+
+  test("an inline indexing write guards the indexing ternary pointer", () => {
+    const source = `${HEADER}
+interface Line { text: string; n: number }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc", n: 1 }]);
+  onButton((b) => { rows.value[3].n = 7; });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const app = compileVaporApp("n.tsx", source, "N", "gba");
+    // the indexing ternary's pointer tmp is tested once, then written through
+    expect(app.c).toContain(
+      "e0 = (3 >= 0 && 3 < (s32)g_rows_len) ? g_rows + (u16)((u8)(3)) : 0;",
+    );
+    expect(app.c).toContain("if (!e0) vp_tripwires |= VP_TRIP_NULL; else { s32 fv");
+  });
+
+  test("the `if (t)` idiom narrows the pointer and needs no runtime guard", () => {
+    const source = `${HEADER}
+interface Line { text: string; n: number }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc", n: 1 }]);
+  onButton((b) => {
+    const t = rows.value[0];
+    if (t) t.n = 7;
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const app = compileVaporApp("n.tsx", source, "N", "gba");
+    expect(app.c).not.toContain("VP_TRIP_NULL");
+    expect(app.c).toMatch(/if \(l_t_\d+->n != fv\d+\)/);
+  });
+});
+
 // Dead data/functions: nm + grep showed no runtime reads (fleet task 822,
 // scout task-764 §4.2). The cartridge title ships via JS-side header patches
 // (rom.ts); GBA reads palette banks directly; the console runtimes never call

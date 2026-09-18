@@ -90,6 +90,10 @@ u8 vp_sb_eq(const vp_sb *a, const vp_sb *b);
 #define VP_TRIP_PLATFORM_RENDER 8
 /* putChar into an out-of-range record string index: no byte is written. */
 #define VP_TRIP_INDEX 16
+/* field write through a record pointer that is null because the pool index
+ * was out of range: the write is skipped. Real Vue throws TypeError there;
+ * an unguarded dereference of address 0 hangs the GBA. */
+#define VP_TRIP_NULL 32
 extern u8 vp_tripwires;
 
 /* core state shared with the per-target runtime */
