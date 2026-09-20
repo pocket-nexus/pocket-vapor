@@ -899,6 +899,92 @@ export default () => {
     expect(app.c).not.toContain("VP_TRIP_NULL");
     expect(app.c).toMatch(/if \(l_t_\d+->n != fv\d+\)/);
   });
+
+  // review task 1161 R1: `cond ? a : b` merged the arm types by taking the
+  // true arm's type wholesale, dropping the false arm's nullable flag. A
+  // narrowed true arm beside an out-of-range index then produced an
+  // unguarded field write on device.
+  test("a ternary merging a narrowed and a nullable arm stays nullable", () => {
+    const src = (order: "narrowed-first" | "nullable-first") => `${HEADER}
+import { putChar } from "../../host/text.ts";
+interface Line { text: string; n: number; enabled: boolean }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc", n: 1, enabled: false }]);
+  const choose = ref(true);
+  onButton((b) => {
+    if (b === Button.Left) choose.value = !choose.value;
+    const first = rows.value[0];
+    if (first) {
+      const t = ${order === "narrowed-first" ? "choose.value ? first : rows.value[3]" : "choose.value ? rows.value[3] : first"};
+      if (b === Button.A) t.n = 7;
+      else if (b === Button.B) t.text = putChar(t.text, 0, "Z");
+      else if (b === Button.Down) t.enabled = true;
+    }
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    for (const order of ["narrowed-first", "nullable-first"] as const) {
+      const app = compileVaporApp("n.tsx", src(order), "N", "gba");
+      // one ternary temp, guarded once before every write kind
+      expect(app.c, order).toMatch(/l_t_\d+ = \(g_choose \? l_first_\d+ : e\d+\)|l_t_\d+ = \(g_choose \? e\d+ : l_first_\d+\)/);
+      expect(app.c, order).toMatch(/if \(!l_t_\d+\) vp_tripwires \|= VP_TRIP_NULL; else \{ s32 fv\d+ = \(s32\)\(7\);/);
+      expect(app.c, order).toMatch(/if \(!l_t_\d+\) vp_tripwires \|= VP_TRIP_NULL; else \{ u8 fv\d+ = \(u8\)\(1\);/);
+      expect(app.c, order).toMatch(/if \(!l_t_\d+\) vp_tripwires \|= VP_TRIP_NULL; else if \(vp_sb_put\(&l_t_\d+->text, 0, 'Z'\)\)/);
+    }
+  });
+
+  test("a nested ternary unions nullable across all arms", () => {
+    const source = `${HEADER}
+interface Line { text: string; n: number }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc", n: 1 }]);
+  const a = ref(true);
+  const c = ref(false);
+  onButton((b) => {
+    if (b === Button.Left) a.value = !a.value;
+    if (b === Button.Right) c.value = !c.value;
+    const first = rows.value[0];
+    if (first) {
+      const second = rows.value[1];
+      if (second) {
+        const t = a.value ? first : c.value ? second : rows.value[9];
+        t.n = 3;
+      }
+    }
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const app = compileVaporApp("n.tsx", source, "N", "gba");
+    expect(app.c).toMatch(/if \(!l_t_\d+\) vp_tripwires \|= VP_TRIP_NULL; else \{ s32 fv\d+ = \(s32\)\(3\);/);
+  });
+
+  test("a ternary of two narrowed non-null arms needs no runtime guard", () => {
+    const source = `${HEADER}
+interface Line { text: string; n: number }
+export default () => {
+  const rows = ref<Line[]>([{ text: "abc", n: 1 }, { text: "def", n: 2 }]);
+  const choose = ref(true);
+  onButton((b) => {
+    if (b === Button.Left) choose.value = !choose.value;
+    const a = rows.value[0];
+    if (a) {
+      const c = rows.value[1];
+      if (c) {
+        const t = choose.value ? a : c;
+        t.n = 7;
+      }
+    }
+  });
+  return (<><row y={0}>{""}</row></>);
+};
+`;
+    const app = compileVaporApp("n.tsx", source, "N", "gba");
+    expect(app.c).not.toContain("VP_TRIP_NULL");
+    expect(app.c).toMatch(/l_t_\d+ = \(g_choose \? l_a_\d+ : l_c_\d+\);/);
+    expect(app.c).toMatch(/if \(l_t_\d+->n != fv\d+\)/);
+  });
 });
 
 // char vs one-character string literal: JS sees both as the one-char string

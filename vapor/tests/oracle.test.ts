@@ -292,6 +292,43 @@ describe("pure number helper fixture under real Vue Vapor", () => {
   });
 });
 
+// A record pointer chosen by a ternary is ordinary Vue semantics; the AOT
+// type merge (nullable = union of both arms, review task 1161 R1) must not
+// change which record is written on the valid path. The null-arm device
+// contract (VP_TRIP_NULL) is covered in null-write-parity.test.ts.
+const NULL_TERNARY_ENTRY = join(import.meta.dir, "fixtures", "null-ternary-entry.ts");
+const NULL_TERNARY_FIXTURE = join(import.meta.dir, "fixtures", "null-ternary.tsx");
+const nullTernaryStyles = compileVaporApp(
+  NULL_TERNARY_FIXTURE,
+  await Bun.file(NULL_TERNARY_FIXTURE).text(),
+  "NULL TERNARY",
+  "gba",
+).styles;
+
+describe("ternary-selected record pointer under the real Vue oracle", () => {
+  const row = (o: Awaited<ReturnType<typeof bootOracle>>, y: number) =>
+    o.grid().chars[y].slice(0, 12).trimEnd();
+
+  test("writes land on whichever valid arm the selector picks", async () => {
+    const o = await bootOracle({ width: 30, height: 20, styles: nullTernaryStyles, entry: NULL_TERNARY_ENTRY });
+    expect(row(o, 0)).toBe("abcde|1|N");
+    expect(row(o, 3)).toBe("pqrst|4|N");
+    await o.press(Button.A); // far=true, choose=true -> first
+    expect(row(o, 0)).toBe("abcde|7|N");
+    expect(row(o, 3)).toBe("pqrst|4|N");
+    await o.press(Button.Left); // choose=false -> fourth record next time
+    await o.press(Button.A);
+    expect(row(o, 0)).toBe("abcde|7|N");
+    expect(row(o, 3)).toBe("pqrst|7|N");
+    await o.press(Button.Left);
+    await o.press(Button.B); // putChar on first again
+    expect(row(o, 0)).toBe("Zbcde|7|N");
+    await o.press(Button.Down); // boolean field on first
+    expect(row(o, 0)).toBe("Zbcde|7|Y");
+    o.unmount();
+  });
+});
+
 // Parentheses around a call callee are semantically neutral in real Vue:
 // `(inc)(x)` runs the same closure as `inc(x)`. The AOT purity/recursion
 // gates must therefore accept pure helper chains written with parens while

@@ -2070,6 +2070,12 @@ class AppCompiler {
       const a = this.compileExpr(e.whenTrue, out, ind);
       const b = this.compileExpr(e.whenFalse, out, ind);
       if (a.ty.k !== b.ty.k) this.err(e, `ternary arms differ: ${a.ty.k} vs ${b.ty.k}`);
+      // Record pointers merge like a union: if EITHER arm can be null (an
+      // out-of-range pool index), the result can be null. Taking just the
+      // true arm's flag dropped the guards on number/boolean/putChar writes
+      // through the merged local (review task 1161 R1).
+      if (a.ty.k === "obj" && b.ty.k === "obj")
+        return { c: `(${this.truthy(c)} ? ${a.c} : ${b.c})`, ty: { ...a.ty, nullable: a.ty.nullable || b.ty.nullable } };
       return { c: `(${this.truthy(c)} ? ${a.c} : ${b.c})`, ty: a.ty };
     }
 
