@@ -180,8 +180,10 @@ Enforced with diagnostics, not documentation. In:
     classifies cells by comparing against a space — e.g. reading level text
     past a row's end — therefore takes different branches on the two sides.
     Treat an out-of-range index as outside the subset and guard it at the
-    call site: `x < line.text.length ? line.text[x] : CH[empty]`. The
-    Sokoban board never depends on the space sentinel.
+    call site: `x >= 0 && x < line.text.length ? line.text[x] : CH[empty]`
+    (the lower bound matters too: a negative `x` renders a space on device
+    but nothing in the oracle). The Sokoban board never depends on the
+    space sentinel.
 - **Local const modules**: `import { X, Y } from "./levels.ts"` pulls in a
   relative-path module that may only declare `export const` literals
   (number / string / string[] / `{name: number}`), closed `export interface`s,

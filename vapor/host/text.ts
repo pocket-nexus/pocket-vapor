@@ -24,8 +24,10 @@
 // returns the space sentinel ' ' when i < 0 || i >= len, whereas real Vue
 // returns undefined and interpolates nothing. No tripwire fires for such a
 // read, so apps must guard before classifying a cell by its byte
-// (`i < line.text.length ? line.text[i] : CH[empty]`) rather than rely on
-// the device's space. See DESIGN.md §4 "Out-of-range reads diverge".
+// (`x >= 0 && x < line.text.length ? line.text[x] : CH[empty]` — a
+// negative index renders a space on device but nothing in the oracle)
+// rather than rely on the device's space. See DESIGN.md §4 "Out-of-range
+// reads diverge".
 
 /**
  * Return `s` with the character at `i` replaced by `ch`. Returns `s`
