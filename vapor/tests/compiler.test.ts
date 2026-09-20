@@ -460,6 +460,92 @@ export default () => {
     expect(compileErr(source)).toContain("can reach the end without returning a value");
   });
 
+  test("parenthesized callee cannot hide a void call from a number helper", () => {
+    // review task 1155 R1: the code generator strips parens from the callee,
+    // so analysis must classify `(side)()` exactly like `side()`. One or
+    // many paren layers must not smuggle a void-helper call into a pure
+    // number helper.
+    const head = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function side(): void { count.value = count.value + 1; }
+  function pure(x: number): number {`;
+    const tail = ` return x + 1; }
+  onButton((b) => {});
+  return (<><row y={0}>{pure(count.value)}</row></>);
+};
+`;
+    expect(compileErr(`${head} side();${tail}`)).toMatch(/^test\.tsx:\d+:\d+ .*void helper/);
+    expect(compileErr(`${head} (side)();${tail}`)).toContain("void helper");
+    expect(compileErr(`${head} ((side))();${tail}`)).toContain("void helper");
+    expect(compileErr(`${head} (side)?.();${tail}`)).toContain("void helper");
+  });
+
+  test("parenthesized push/splice and keymap dispatch still trip the purity gate", () => {
+    const listHead = `${HEADER}
+interface It { k: number }
+export default () => {
+  const items = ref<It[]>([{ k: 1 }]);`;
+    const listTail = `onButton((b) => {});
+  return (<><row y={0}>{size()}</row></>);
+};
+`;
+    expect(
+      compileErr(`${listHead}
+  function size(): number { (items.value.push)({ k: 2 }); return items.value.length; }
+  ${listTail}`),
+    ).toContain("must be pure");
+    expect(
+      compileErr(`${listHead}
+  function size(): number { ((items.value.splice))(0, 1); return items.value.length; }
+  ${listTail}`),
+    ).toContain("must be pure");
+    const kmHead = `${HEADER}
+export default () => {
+  const count = ref(0);
+  function bump(): void { count.value = count.value + 1; }
+  const KM = { [Button.A]: bump };
+  function sneaky(t: number): number {`;
+    const kmTail = ` return t + 1; }
+  onButton((b) => {});
+  return (<><row y={0}>{sneaky(count.value)}</row></>);
+};
+`;
+    expect(compileErr(`${kmHead} (KM[Button.A])?.();${kmTail}`)).toContain("must be pure");
+    expect(compileErr(`${kmHead} ((KM[Button.A]))();${kmTail}`)).toContain("must be pure");
+  });
+
+  test("parenthesized self-call still closes the recursion graph", () => {
+    const head = `${HEADER}
+export default () => {
+  function down(n: number): number { if (n < 1) return 0; return`;
+    const tail = `; }
+  onButton((b) => {});
+  return (<><row y={0}>{down(3)}</row></>);
+};
+`;
+    expect(compileErr(`${head} down(n - 1)${tail}`)).toContain("recursive");
+    expect(compileErr(`${head} (down)(n - 1)${tail}`)).toContain("recursive");
+    expect(compileErr(`${head} ((down))((n - 1))${tail}`)).toContain("recursive");
+  });
+
+  test("parenthesized calls between pure number helpers are accepted", () => {
+    // parens around a callee are semantically neutral in Vue; pure helper
+    // chains through parens must compile to the same direct C calls.
+    const source = `${HEADER}
+export default () => {
+  const count = ref(1);
+  function inc(x: number): number { return x + 1; }
+  function quad(x: number): number { return ((inc))((inc)(x)) + (inc)(inc(x)); }
+  onButton((b) => { if (b === Button.A) count.value = quad(count.value); });
+  return (<><row y={0}>N {count.value} Q {quad(0)}</row></>);
+};
+`;
+    const app = compileVaporApp("test.tsx", source);
+    expect(app.c).toMatch(/static s32 fn_quad\(s32 p_x\) \{[^}]*fn_inc\(fn_inc\(p_x\)\) \+ fn_inc\(fn_inc\(p_x\)\)/s);
+    expect(app.c).toContain("vp_ln_int(fn_quad(0))");
+  });
+
   test("components inline to zero-cost paint code", async () => {
     const source = await Bun.file(ENTRY).text();
     const app = compileVaporApp(ENTRY, source);
@@ -1695,6 +1781,28 @@ export default () => {
     }
   });
 
+  test("rejects a parenthesized recursive module helper call", async () => {
+    // review task 1155 R1: the static call graph must unparen the callee,
+    // or `(go)(n - 1)` hides the self-edge while the generator emits a real
+    // recursive C call (unsupported: no C stack budget).
+    for (const call of ["(go)(n - 1)", "((go))((n - 1))"]) {
+      const mod = `export function go(n: number) { if (n > 0) ${call}; }\n`;
+      let msg = "";
+      const proj = await makeProject({ "mod.ts": mod, "app.tsx": recApp('import { go } from "./mod.ts";') });
+      try {
+        try {
+          compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+        } catch (e) {
+          expect(e).toBeInstanceOf(VaporCompileError);
+          msg = (e as Error).message;
+        }
+        expect(msg, call).toMatch(/mod\.ts:1:\d+ .*recursi/i);
+      } finally {
+        await rm(proj.dir, { recursive: true, force: true });
+      }
+    }
+  });
+
   test("rejects mutually recursive helpers inside one module", async () => {
     const mod =
       "export function a(n: number) { if (n > 0) b(n - 1); }\n" +
@@ -1735,6 +1843,33 @@ export default () => {
         msg = (e as Error).message;
       }
       expect(msg).toMatch(/app\.tsx:6:39 — .*recursi/i);
+    } finally {
+      await rm(proj.dir, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a parenthesized recursive in-file void setup helper", async () => {
+    // same unparen requirement on the setup-helper side of the static graph
+    const app = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST_INPUT}";
+export default () => {
+  const n = ref(0);
+  function go(n: number) { if (n > 0) (go)(n - 1); }
+  onButton((b) => { if (b === Button.A) go(1); });
+  return (<><row y={0}>{n.value}</row></>);
+};
+`;
+    let msg = "";
+    const proj = await makeProject({ "app.tsx": app });
+    try {
+      try {
+        compileVaporApp(proj.entry, await Bun.file(proj.entry).text());
+      } catch (e) {
+        expect(e).toBeInstanceOf(VaporCompileError);
+        msg = (e as Error).message;
+      }
+      expect(msg).toMatch(/app\.tsx:6:\d+ — .*recursi/i);
     } finally {
       await rm(proj.dir, { recursive: true, force: true });
     }

@@ -992,9 +992,15 @@ class AppCompiler {
     fns: Map<string, FnBinding>,
     onCall: (callee: FnBinding, node: ts.CallExpression) => void,
   ): void {
-    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-      const callee = shadows.has(node.expression.text) ? undefined : fns.get(node.expression.text);
-      if (callee) onCall(callee, node);
+    if (ts.isCallExpression(node)) {
+      // Unparen the callee before classifying: `(loop)(n - 1)` is the same
+      // call as `loop(n - 1)` and must land in the same static recursion
+      // edges (review task 1155 R1; the code generator unparens too).
+      const calleeExpr = this.unparen(node.expression);
+      if (ts.isIdentifier(calleeExpr)) {
+        const callee = shadows.has(calleeExpr.text) ? undefined : fns.get(calleeExpr.text);
+        if (callee) onCall(callee, node);
+      }
     }
     // Arrow params introduce a new lexical scope (defensive: helper args are
     // numbers, but a callback's params must not resolve as helper names).
@@ -1140,14 +1146,19 @@ class AppCompiler {
         };
         const walk = (node: ts.Node): void => {
           if (ts.isCallExpression(node)) {
-            if (ts.isIdentifier(node.expression)) {
-              callees.push({ name: node.expression.text, node });
+            // The code generators (compileCall / compileExprStmt) unparen the
+            // callee, so the static checks must classify the same expression:
+            // `(bump)()`, `(KM[i])?.()` and `(items.value.push)(...)` are the
+            // same calls as without the parens (review task 1155 R1).
+            const callee = unwrapParen(node.expression);
+            if (ts.isIdentifier(callee)) {
+              callees.push({ name: callee.text, node });
             } else if (
-              ts.isPropertyAccessExpression(node.expression) &&
-              (node.expression.name.text === "push" || node.expression.name.text === "splice")
+              ts.isPropertyAccessExpression(callee) &&
+              (callee.name.text === "push" || callee.name.text === "splice")
             ) {
               noteWrite(node);
-            } else if (ts.isElementAccessExpression(node.expression)) {
+            } else if (ts.isElementAccessExpression(callee)) {
               // indirect dispatch such as a keymap table `KM[i]?.()`: the
               // static graph cannot name the callee, which may be a void
               // action that writes refs. Count it as a possible write so the

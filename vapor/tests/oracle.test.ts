@@ -292,6 +292,75 @@ describe("pure number helper fixture under real Vue Vapor", () => {
   });
 });
 
+// Parentheses around a call callee are semantically neutral in real Vue:
+// `(inc)(x)` runs the same closure as `inc(x)`. The AOT purity/recursion
+// gates must therefore accept pure helper chains written with parens while
+// still rejecting void/dispatch smuggling (review task 1155; rejects live
+// in compiler.test.ts).
+describe("parenthesized pure-helper calls under the real Vue oracle", () => {
+  const HOST = join(import.meta.dir, "..", "host", "input.ts");
+  const APP_TSX = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "${HOST}";
+export default () => {
+  const n = ref(1);
+  function inc(x: number): number { return x + 1; }
+  function quad(x: number): number { return ((inc))((inc)(x)) + (inc)(inc(x)); }
+  onButton((b) => {
+    if (b === Button.A) n.value = quad(n.value);
+    if (b === Button.B) n.value = 1;
+  });
+  return (<><row y={0}>N {n.value} Q {quad(0)}</row></>);
+};
+`;
+  const ENTRY_TS = `
+import { createVaporApp, nextTick } from "vue";
+import App from "./app.tsx";
+import { __dispatchButton, __resetButtons } from "${HOST}";
+const hooks = globalThis as Record<string, unknown>;
+hooks.__vaporBoot = (container: unknown) => {
+  __resetButtons();
+  const app = (createVaporApp as unknown as (c: unknown) => { mount(c: unknown): void; unmount(): void })({
+    setup: () => (App as () => unknown)(),
+  });
+  app.mount(container);
+  return app;
+};
+hooks.__vaporPress = (button: number): void => { __dispatchButton(button); };
+hooks.__vaporAxisDelta = (): void => {};
+hooks.__vaporTick = (): Promise<void> => nextTick();
+`;
+
+  async function bootParenOracle(): Promise<{ o: Oracle; cleanup: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-oracle-paren-"));
+    await writeFile(join(dir, "app.tsx"), APP_TSX);
+    await writeFile(join(dir, "entry.ts"), ENTRY_TS);
+    // the same source must pass the AOT frontend and lower to direct calls;
+    // if analysis ever skips parenthesized callees again, either the gate
+    // breaks or the generated C stops calling fn_inc.
+    const compiled = compileVaporApp(join(dir, "app.tsx"), APP_TSX, "PAREN HELPER", "gba");
+    expect(compiled.c).toContain("fn_inc(fn_inc(p_x)) + fn_inc(fn_inc(p_x))");
+    const o = await bootOracle({ width: 30, height: 20, styles: compiled.styles, entry: join(dir, "entry.ts") });
+    return { o, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  }
+
+  test("quad renders 4 and A applies the paren-written helper chain like Vue", async () => {
+    const { o, cleanup } = await bootParenOracle();
+    try {
+      expect(o.grid().chars[0]).toBe("N 1 Q 4".padEnd(30)); // quad(0) = inc(inc(0)) * 2
+      await o.press(Button.A); // quad(1) = 3 + 3
+      expect(o.grid().chars[0]).toBe("N 6 Q 4".padEnd(30));
+      await o.press(Button.A); // quad(6) = 8 + 8
+      expect(o.grid().chars[0]).toBe("N 16 Q 4".padEnd(30));
+      await o.press(Button.B); // reset
+      expect(o.grid().chars[0]).toBe("N 1 Q 4".padEnd(30));
+      o.unmount();
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
 // Cross-file const module imports behave identically under the real Vue
 // Vapor oracle: the local `./levels.ts` is an ordinary TS module on the
 // oracle side, and the AOT compiler folds the same consts (fleet task 1002).
