@@ -119,7 +119,11 @@ describe("sokoban playdate: boot layout on 50x30", () => {
     expect(rowText(o, 0)).toContain("MOVES 0");
     expect(rowText(o, 28)).toContain("SKINNER");
     expect(rowText(o, 29)).toContain("CRANK");
-    expect(rowText(o, 29)).toContain("UNDO/REDO");
+    expect(rowText(o, 29)).toContain("UNDO");
+    expect(rowText(o, 29)).toContain("REDO");
+    // the help row starts at x=1 on a 50-column screen, so its literal must
+    // fit in 49 cells; the trailing "A LEVELS" must not be clipped
+    expect(rowText(o, 29)).toContain("A LEVELS");
     for (let y = 0; y < BH; y++) expect(board(o)[y]).toBe(LEVEL_ROM.slice(y * BW, y * BW + BW));
     o.unmount();
   });
@@ -212,6 +216,117 @@ describe("sokoban playdate: crank undo/redo scrub", () => {
     expect(cell(o, 4, 4)).toBe("$");
     expect(cell(o, 5, 4)).toBe("@");
     expect(movesOf(o)).toBe(8);
+    o.unmount();
+  });
+});
+
+describe("sokoban playdate: crank remainder dies at mode and level boundaries", () => {
+  // Review 1272 showed a sub-detent remainder accumulated in one mode (or on
+  // one level) completing a detent after a restart or inside the chooser.
+  // The remainder belongs to one continuous crank gesture: every mode change,
+  // every level load and every effective d-pad step must drop it.
+  const NEARLY = -(DETENT - 1);
+
+  test("restart (A then A) drops an anti-clockwise remainder from before it", async () => {
+    const o = await boot();
+    await o.press(Button.Up);
+    await o.press(Button.Up); // moves = 2
+    await o.axisDelta(RelativeAxis.Primary, NEARLY); // -44999, no detent yet
+    await o.press(Button.A); // chooser, cursor on slot 1
+    await o.press(Button.A); // confirm slot 1 == restart: pools rebuilt
+    expect(movesOf(o)).toBe(0);
+    await o.press(Button.Up); // one fresh post-restart move
+    expect(movesOf(o)).toBe(1);
+    await o.axisDelta(RelativeAxis.Primary, -1); // the leaked remainder would undo
+    expect(movesOf(o)).toBe(1);
+    expect(cell(o, 4, 2)).toBe("@");
+    o.unmount();
+  });
+
+  test("opening the chooser drops a clockwise remainder accumulated in MOVE", async () => {
+    const o = await boot();
+    await o.axisDelta(RelativeAxis.Primary, DETENT - 1); // redo stack empty: no step
+    await o.press(Button.A);
+    expect(rowText(o, BANNER_Y)).toContain("LEVEL 01/24");
+    await o.axisDelta(RelativeAxis.Primary, 1); // a leaked remainder would step to 02
+    expect(rowText(o, BANNER_Y)).toContain("LEVEL 01/24");
+    o.unmount();
+  });
+
+  test("cancelling the chooser drops an anti-clockwise remainder accumulated in it", async () => {
+    const o = await boot();
+    await o.press(Button.Up); // moves = 1
+    await o.press(Button.A); // chooser
+    await o.axisDelta(RelativeAxis.Primary, NEARLY); // cursor does not move yet
+    expect(rowText(o, BANNER_Y)).toContain("LEVEL 01/24");
+    await o.press(Button.B); // back to MOVE
+    await o.axisDelta(RelativeAxis.Primary, -1); // leaked remainder would undo the Up
+    expect(movesOf(o)).toBe(1);
+    expect(cell(o, 4, 2)).toBe("@");
+    o.unmount();
+  });
+
+  test("an effective d-pad move drops a pending undo remainder; a wall bump keeps it", async () => {
+    const o = await boot();
+    await o.press(Button.Up);
+    await o.press(Button.Up); // moves = 2, player on the goal
+    await o.axisDelta(RelativeAxis.Primary, NEARLY);
+    await o.press(Button.Right); // (4,1) into the wall at (5,1): refused, gesture lives
+    await o.axisDelta(RelativeAxis.Primary, -1);
+    expect(movesOf(o)).toBe(1); // the bump did not break the gesture
+    await o.axisDelta(RelativeAxis.Primary, NEARLY); // arm a near-detent again
+    await o.press(Button.Down); // effective step (4,2)->(4,3), moves = 2
+    expect(movesOf(o)).toBe(2);
+    await o.axisDelta(RelativeAxis.Primary, -1); // must not undo the new step
+    expect(movesOf(o)).toBe(2);
+    expect(cell(o, 4, 3)).toBe("@");
+    o.unmount();
+  });
+
+  test("a fresh d-pad move also drops a clockwise redo remainder", async () => {
+    const o = await boot();
+    await o.press(Button.Up); // moves = 1
+    await o.axisDelta(RelativeAxis.Primary, -DETENT); // undo, one redo queued
+    await o.axisDelta(RelativeAxis.Primary, DETENT - 1); // near redo, no step
+    expect(movesOf(o)).toBe(0);
+    await o.press(Button.Right); // fresh move clears the redo branch and the remainder
+    expect(movesOf(o)).toBe(1);
+    // A surviving +44999 would cancel this near-complete anti-clockwise detent;
+    // with the remainder dropped it undoes the Right exactly once.
+    await o.axisDelta(RelativeAxis.Primary, -(DETENT - 1));
+    await o.axisDelta(RelativeAxis.Primary, -1);
+    expect(movesOf(o)).toBe(0);
+    expect(cell(o, 4, 3)).toBe("@");
+    o.unmount();
+  });
+
+  test("B undo is the same gesture as anti-clockwise crank: it keeps the remainder", async () => {
+    const o = await boot();
+    await o.press(Button.Up);
+    await o.press(Button.Up); // moves = 2
+    await o.axisDelta(RelativeAxis.Primary, NEARLY);
+    await o.press(Button.B); // one undo by button, remainder still armed
+    expect(movesOf(o)).toBe(1);
+    await o.axisDelta(RelativeAxis.Primary, -1); // completes the detent: one more undo
+    expect(movesOf(o)).toBe(0);
+    expect(cell(o, 4, 3)).toBe("@");
+    o.unmount();
+  });
+
+  test("solving the last level drops the remainder, so A->chooser needs a full detent", async () => {
+    const o = await boot();
+    await o.press(Button.A);
+    for (let i = 0; i < LEVEL_COUNT - 1; i++) await o.press(Button.Right); // cursor 24
+    await o.press(Button.A); // load slot 24
+    expect(rowText(o, 0)).toContain("SOKOBAN 24/24");
+    await o.axisDelta(RelativeAxis.Primary, DETENT - 1); // no-op redo, near-detent armed
+    await pressPath(o, SOLVE24); // first effective move already drops the remainder
+    expect(modeOf(o)).toBe(2);
+    await o.press(Button.A); // last level: chooser aimed at slot 24
+    expect(modeOf(o)).toBe(1);
+    expect(rowText(o, BANNER_Y)).toContain("LEVEL 24/24");
+    await o.axisDelta(RelativeAxis.Primary, 1); // a leak would wrap the cursor to 01
+    expect(rowText(o, BANNER_Y)).toContain("LEVEL 24/24");
     o.unmount();
   });
 });
