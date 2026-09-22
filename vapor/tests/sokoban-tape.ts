@@ -131,3 +131,135 @@ export const SOKOBAN_SLOT_AFTER: readonly number[] = [
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 2,
 ];
+export const SOKOBAN_HIST_BOUNDARY_TAPE: readonly number[] = [
+  Button.Up    , // h 1
+  Button.Up    , // h 2
+  Button.Left  , // h 3
+  Button.Down  , // h 4
+  Button.Up    , // h 5
+  Button.Down  , // h 6
+  Button.Up    , // h 7
+  Button.Down  , // h 8
+  Button.Up    , // h 9
+  Button.Down  , // h10
+  Button.Up    , // h11
+  Button.Down  , // h12
+  Button.Up    , // h13
+  Button.Down  , // h14
+  Button.Up    , // h15
+  Button.Down  , // h16
+  Button.Up    , // h17
+  Button.Down  , // h18
+  Button.Up    , // h19
+  Button.Down  , // h20
+  Button.Up    , // h21
+  Button.Down  , // h22
+  Button.Up    , // h23
+  Button.Down  , // h24
+  Button.Up    , // h25
+  Button.Down  , // h26
+  Button.Up    , // h27
+  Button.Down  , // h28
+  Button.Up    , // h29
+  Button.Down  , // h30
+  Button.Up    , // h31
+  Button.Down  , // h32
+  Button.Up    , // h33
+  Button.Down  , // h34
+  Button.Up    , // h35
+  Button.Down  , // h36
+  Button.Up    , // h37
+  Button.Down  , // h38
+  Button.Up    , // h39
+  Button.Down  , // h40
+  Button.Up    , // h41
+  Button.Down  , // h42
+  Button.Up    , // h43
+  Button.Down  , // h44
+  Button.Up    , // h45
+  Button.Down  , // h46
+  Button.Up    , // h47
+  Button.Down  , // h48
+  Button.Up    , // h49
+  Button.Down  , // h50
+  Button.Up    , // h51
+  Button.Down  , // h52
+  Button.Right , // h53
+  Button.Down  , // h54
+  Button.Right , // h55
+  Button.Right , // h56
+  Button.Down  , // h57
+  Button.Left  , // h58
+  Button.Up    , // h59
+  Button.Left  , // h60
+  Button.Up    , // h61
+  Button.Left  , // h62
+  Button.Down  , // h63 *** push 63: recorded (hist 63)
+  Button.Down  , // h64 *** push 64: recorded (hist 64 = full)
+  Button.Right , // h65 *** push 65: REFUSED at the cap, no mutation
+  Button.B     , // u 1: undo h64
+  Button.B     , // u 2: undo h63
+  Button.B     , // u 3: undo h62
+  Button.B     , // u 4: undo h61
+  Button.B     , // u 5: undo h60
+  Button.B     , // u 6: undo h59
+  Button.B     , // u 7: undo h58
+  Button.B     , // u 8: undo h57
+  Button.B     , // u 9: undo h56
+  Button.B     , // u10: undo h55
+  Button.B     , // u11: undo h54
+  Button.B     , // u12: undo h53
+  Button.B     , // u13: undo h52
+  Button.B     , // u14: undo h51
+  Button.B     , // u15: undo h50
+  Button.B     , // u16: undo h49
+  Button.B     , // u17: undo h48
+  Button.B     , // u18: undo h47
+  Button.B     , // u19: undo h46
+  Button.B     , // u20: undo h45
+  Button.B     , // u21: undo h44
+  Button.B     , // u22: undo h43
+  Button.B     , // u23: undo h42
+  Button.B     , // u24: undo h41
+  Button.B     , // u25: undo h40
+  Button.B     , // u26: undo h39
+  Button.B     , // u27: undo h38
+  Button.B     , // u28: undo h37
+  Button.B     , // u29: undo h36
+  Button.B     , // u30: undo h35
+  Button.B     , // u31: undo h34
+  Button.B     , // u32: undo h33
+  Button.B     , // u33: undo h32
+  Button.B     , // u34: undo h31
+  Button.B     , // u35: undo h30
+  Button.B     , // u36: undo h29
+  Button.B     , // u37: undo h28
+  Button.B     , // u38: undo h27
+  Button.B     , // u39: undo h26
+  Button.B     , // u40: undo h25
+  Button.B     , // u41: undo h24
+  Button.B     , // u42: undo h23
+  Button.B     , // u43: undo h22
+  Button.B     , // u44: undo h21
+  Button.B     , // u45: undo h20
+  Button.B     , // u46: undo h19
+  Button.B     , // u47: undo h18
+  Button.B     , // u48: undo h17
+  Button.B     , // u49: undo h16
+  Button.B     , // u50: undo h15
+  Button.B     , // u51: undo h14
+  Button.B     , // u52: undo h13
+  Button.B     , // u53: undo h12
+  Button.B     , // u54: undo h11
+  Button.B     , // u55: undo h10
+  Button.B     , // u56: undo h9
+  Button.B     , // u57: undo h8
+  Button.B     , // u58: undo h7
+  Button.B     , // u59: undo h6
+  Button.B     , // u60: undo h5
+  Button.B     , // u61: undo h4
+  Button.B     , // u62: undo h3
+  Button.B     , // u63: undo h2
+  Button.B     , // u64: undo h1
+  Button.B     , // u65: extra undo past the empty bottom is a no-op
+];

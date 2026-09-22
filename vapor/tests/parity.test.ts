@@ -25,18 +25,25 @@ import type { StyleTable } from "../compiler/styles.ts";
 import { buildRom } from "../compiler/rom.ts";
 import { bootOracle } from "../oracle/boot.ts";
 import { TODO_TAPE } from "./todo-tape.ts";
-import { SOKOBAN_TAPE } from "./sokoban-tape.ts";
+import { SOKOBAN_TAPE, SOKOBAN_HIST_BOUNDARY_TAPE } from "./sokoban-tape.ts";
 
 const HERE = import.meta.dir;
 const OUT = join(HERE, "..", "..", "dist", "vapor");
 const MGBA_RUNNER = join(HERE, "harness", "mgba_runner");
 const NES_RUNNER = join(HERE, "harness", "nes_runner.ts");
 
+interface AppTape {
+  /** label used in the test name */
+  name: string;
+  tape: readonly number[];
+}
+
 interface AppCase {
   name: string;
   entry: string;
   title: string;
-  tape: readonly number[];
+  /** every tape is replayed on the oracle and all three consoles */
+  tapes: readonly AppTape[];
   /** oracle bundle entry; undefined uses the default todo entry */
   oracleEntry?: string;
 }
@@ -46,13 +53,18 @@ const CASES: readonly AppCase[] = [
     name: "todo",
     entry: join(HERE, "..", "examples", "todo", "todo.tsx"),
     title: "VAPOR TODO",
-    tape: TODO_TAPE,
+    tapes: [{ name: "main", tape: TODO_TAPE }],
   },
   {
     name: "sokoban",
     entry: join(HERE, "..", "examples", "sokoban", "sokoban.tsx"),
     title: "SOKOBAN",
-    tape: SOKOBAN_TAPE,
+    tapes: [
+      { name: "main", tape: SOKOBAN_TAPE },
+      // crosses the 64-record undo pool: the 65th legal move is refused and
+      // 64 undos restore the board (review task 1216)
+      { name: "history-boundary", tape: SOKOBAN_HIST_BOUNDARY_TAPE },
+    ],
     oracleEntry: join(HERE, "..", "oracle", "entry-sokoban.ts"),
   },
 ];
@@ -169,8 +181,8 @@ function decodeGrid(
 }
 
 interface RigRun {
-  steps: DeviceStep[];
-  trips: number;
+  /** one captured replay per tape, keyed by the AppTape name */
+  tapes: Map<string, { steps: DeviceStep[]; trips: number }>;
   styles: StyleTable;
 }
 
@@ -191,86 +203,93 @@ beforeAll(async () => {
       const rom = join(OUT, `${appCase.name}.${rig.ext}`);
       await buildRom(app, rig.name, rom);
 
-      const vramLen = (rig.vram.orgY + t.height) * rig.vram.stride * rig.vram.entrySize;
-      const probeLines = (i: number) => [
-        `D chars${i} 0x${rig.charsAddr.toString(16)} ${cells}`,
-        `D pals${i} 0x${rig.palsAddr.toString(16)} ${cells}`,
-        `${rig.vram.cmd} vram${i} 0x${rig.vram.addr.toString(16)} ${vramLen}`,
-      ];
-      const lines: string[] = [rig.boot, ...probeLines(0)];
-      appCase.tape.forEach((b, i) => {
-        lines.push(rig.press(1 << b));
-        lines.push(...probeLines(i + 1));
-      });
-      lines.push(`R trips 0x${rig.tripsAddr.toString(16)} 1`);
-      const scenario = join(OUT, `parity-${appCase.name}-${rig.name}.txt`);
-      await Bun.write(scenario, lines.join("\n") + "\n");
+      const tapeRuns = new Map<string, { steps: DeviceStep[]; trips: number }>();
+      for (const appTape of appCase.tapes) {
+        const vramLen = (rig.vram.orgY + t.height) * rig.vram.stride * rig.vram.entrySize;
+        const probeLines = (i: number) => [
+          `D chars${i} 0x${rig.charsAddr.toString(16)} ${cells}`,
+          `D pals${i} 0x${rig.palsAddr.toString(16)} ${cells}`,
+          `${rig.vram.cmd} vram${i} 0x${rig.vram.addr.toString(16)} ${vramLen}`,
+        ];
+        const lines: string[] = [rig.boot, ...probeLines(0)];
+        appTape.tape.forEach((b, i) => {
+          lines.push(rig.press(1 << b));
+          lines.push(...probeLines(i + 1));
+        });
+        lines.push(`R trips 0x${rig.tripsAddr.toString(16)} 1`);
+        const scenario = join(OUT, `parity-${appCase.name}-${rig.name}-${appTape.name}.txt`);
+        await Bun.write(scenario, lines.join("\n") + "\n");
 
-      const out = await rig.run(rom, scenario);
-      const parsed = JSON.parse(out) as { ok: boolean; reads: Record<string, string | number> };
-      expect(parsed.ok).toBe(true);
-      const steps: DeviceStep[] = [];
-      for (let i = 0; i <= appCase.tape.length; i++) {
-        steps.push(
-          decodeGrid(
-            parsed.reads[`chars${i}`] as string,
-            parsed.reads[`pals${i}`] as string,
-            parsed.reads[`vram${i}`] as string,
-            rig.vram,
-            t.width,
-            t.height,
-          ),
-        );
+        const out = await rig.run(rom, scenario);
+        const parsed = JSON.parse(out) as { ok: boolean; reads: Record<string, string | number> };
+        expect(parsed.ok).toBe(true);
+        const steps: DeviceStep[] = [];
+        for (let i = 0; i <= appTape.tape.length; i++) {
+          steps.push(
+            decodeGrid(
+              parsed.reads[`chars${i}`] as string,
+              parsed.reads[`pals${i}`] as string,
+              parsed.reads[`vram${i}`] as string,
+              rig.vram,
+              t.width,
+              t.height,
+            ),
+          );
+        }
+        tapeRuns.set(appTape.name, { steps, trips: parsed.reads.trips as number });
       }
-      perRig.set(rig.name, { steps, trips: parsed.reads.trips as number, styles: app.styles });
+      perRig.set(rig.name, { tapes: tapeRuns, styles: app.styles });
     }
     runs.set(appCase.name, perRig);
   }
-}, 300000);
+}, 600000);
 
 for (const appCase of CASES) {
   describe(`${appCase.name}: oracle == device, three consoles`, () => {
     for (const rig of RIGS) {
-      test(`${rig.name}: every step of the tape renders identically`, async () => {
-        const t = VAPOR_TARGETS[rig.name];
-        const run = runs.get(appCase.name)!.get(rig.name)!;
-        const oracle = await bootOracle({
-          width: t.width,
-          height: t.height,
-          styles: run.styles,
-          entry: appCase.oracleEntry,
-        });
-        const compare = (step: number, label: string) => {
-          const want = oracle.grid();
-          const got = run.steps[step];
-          for (let y = 0; y < t.height; y++) {
-            expect(`${label} y=${y}: ${got.chars[y]}`).toBe(`${label} y=${y}: ${want.chars[y]}`);
-            expect(`${label} y=${y} pal: ${got.pals[y].join(",")}`).toBe(
-              `${label} y=${y} pal: ${want.pals[y].join(",")}`,
-            );
-            // the player's screen, not just the logical grid: decoded VRAM
-            expect(`${label} y=${y} vram: ${got.vramChars[y]}`).toBe(`${label} y=${y} vram: ${want.chars[y]}`);
-            const styleMap = run.styles.lower(rig.name).styleMap;
-            const wantStyle =
-              rig.name === "gba"
-                ? want.pals[y].join(",")
-                : want.pals[y].map((palId) => styleMap[palId]).join(",");
-            expect(`${label} y=${y} vstyle: ${got.vramStyles[y].join(",")}`).toBe(
-              `${label} y=${y} vstyle: ${wantStyle}`,
-            );
+      for (const appTape of appCase.tapes) {
+        test(`${rig.name}: every step of the ${appTape.name} tape renders identically`, async () => {
+          const t = VAPOR_TARGETS[rig.name];
+          const run = runs.get(appCase.name)!.get(rig.name)!;
+          const captured = run.tapes.get(appTape.name)!;
+          const oracle = await bootOracle({
+            width: t.width,
+            height: t.height,
+            styles: run.styles,
+            entry: appCase.oracleEntry,
+          });
+          const compare = (step: number, label: string) => {
+            const want = oracle.grid();
+            const got = captured.steps[step];
+            for (let y = 0; y < t.height; y++) {
+              expect(`${label} y=${y}: ${got.chars[y]}`).toBe(`${label} y=${y}: ${want.chars[y]}`);
+              expect(`${label} y=${y} pal: ${got.pals[y].join(",")}`).toBe(
+                `${label} y=${y} pal: ${want.pals[y].join(",")}`,
+              );
+              // the player's screen, not just the logical grid: decoded VRAM
+              expect(`${label} y=${y} vram: ${got.vramChars[y]}`).toBe(`${label} y=${y} vram: ${want.chars[y]}`);
+              const styleMap = run.styles.lower(rig.name).styleMap;
+              const wantStyle =
+                rig.name === "gba"
+                  ? want.pals[y].join(",")
+                  : want.pals[y].map((palId) => styleMap[palId]).join(",");
+              expect(`${label} y=${y} vstyle: ${got.vramStyles[y].join(",")}`).toBe(
+                `${label} y=${y} vstyle: ${wantStyle}`,
+              );
+            }
+          };
+          compare(0, `${appCase.name}/${rig.name}/${appTape.name} boot`);
+          for (let i = 0; i < appTape.tape.length; i++) {
+            await oracle.press(appTape.tape[i]);
+            compare(i + 1, `${appCase.name}/${rig.name}/${appTape.name} step ${i} (btn ${appTape.tape[i]})`);
           }
-        };
-        compare(0, `${appCase.name}/${rig.name} boot`);
-        for (let i = 0; i < appCase.tape.length; i++) {
-          await oracle.press(appCase.tape[i]);
-          compare(i + 1, `${appCase.name}/${rig.name} step ${i} (btn ${appCase.tape[i]})`);
-        }
-        oracle.unmount();
-      });
+          oracle.unmount();
+        });
 
-      test(`${rig.name}: no runtime tripwires fired`, () => {
-        expect(runs.get(appCase.name)!.get(rig.name)!.trips).toBe(0);
-      });
+        test(`${rig.name}: no runtime tripwires fire during the ${appTape.name} tape`, () => {
+          expect(runs.get(appCase.name)!.get(rig.name)!.tapes.get(appTape.name)!.trips).toBe(0);
+        });
+      }
     }
   });
 }

@@ -24,6 +24,7 @@ import {
   SOKOBAN_MOVES_AFTER,
   SOKOBAN_MODE_AFTER,
   SOKOBAN_SLOT_AFTER,
+  SOKOBAN_HIST_BOUNDARY_TAPE,
 } from "./sokoban-tape.ts";
 
 const APP = join(import.meta.dir, "..", "examples", "sokoban", "sokoban.tsx");
@@ -410,6 +411,53 @@ describe("sokoban 83-key tape vs the independent model", () => {
         expect(rowText(o, 0)).toContain(`SOKOBAN ${two}/24`);
       }
     }
+    o.unmount();
+  });
+});
+
+describe("sokoban full-history policy: the 65th legal move is refused (review 1216)", () => {
+  async function boot() {
+    const g = GEOMS[0];
+    const o = await bootFor(g);
+    return { o, pad: g.pad };
+  }
+  const MOVES = 65;
+  const PUSH_65 = 64; // tape index of the refused 65th move (0-based)
+
+  test("63/64/65 are pushes; the cap holds moves at 64 and leaves the board at move-64 state", async () => {
+    const { o, pad } = await boot();
+    expect(SOKOBAN_HIST_BOUNDARY_TAPE.length).toBe(65 + 64 + 1);
+    for (let i = 0; i < MOVES; i++) await o.press(SOKOBAN_HIST_BOUNDARY_TAPE[i]);
+    // h63 and h64 were recorded pushes: box 1 driven from (3,3) down to (3,5)
+    expect(cell(o, pad, 3, 5)).toBe("$");
+    expect(cell(o, pad, 3, 4)).toBe("@"); // player after h64
+    // h65 is a LEGAL push (Right into box 2 at (4,4)) but must be refused:
+    // moves stay 64 and nothing on the board changes — most importantly the
+    // player does NOT step to (4,4) and box 2 does NOT move to (5,4).
+    expect(movesOf(o)).toBe(64);
+    expect(modeOf(o)).toBe(0);
+    expect(cell(o, pad, 3, 4)).toBe("@");
+    expect(cell(o, pad, 4, 4)).toBe("$");
+    expect(cell(o, pad, 5, 4)).toBe(" ");
+    // the player gets feedback that the history is saturated
+    expect(rowText(o, 10)).toMatch(/HIST(ORY)? FULL/);
+    o.unmount();
+  });
+
+  test("64 undos replay every recorded inverse and restore the seeded board; extra B is a no-op", async () => {
+    const { o, pad } = await boot();
+    for (let i = 0; i < MOVES; i++) await o.press(SOKOBAN_HIST_BOUNDARY_TAPE[i]);
+    for (let i = MOVES; i < MOVES + 64; i++) await o.press(SOKOBAN_HIST_BOUNDARY_TAPE[i]);
+    expect(movesOf(o)).toBe(0);
+    expect(cell(o, pad, 4, 3)).toBe("@");
+    expect(cell(o, pad, 3, 3)).toBe("*"); // box 1 back on its goal
+    expect(cell(o, pad, 5, 4)).toBe("$"); // box 2 back at its seed
+    for (let y = 0; y < BH; y++) expect(board(o, pad)[y]).toBe(LEVEL_ROM.slice(y * BW, y * BW + BW));
+    expect(rowText(o, 10)).not.toMatch(/HIST(ORY)? FULL/);
+    const before = board(o, pad).join("|");
+    await o.press(SOKOBAN_HIST_BOUNDARY_TAPE[MOVES + 64]); // the 65th, extra B
+    expect(movesOf(o)).toBe(0);
+    expect(board(o, pad).join("|")).toBe(before);
     o.unmount();
   });
 });
