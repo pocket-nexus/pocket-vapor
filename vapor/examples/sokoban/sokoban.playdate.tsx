@@ -10,6 +10,12 @@
 //            anti-clockwise undo, clockwise REDO. Redo is Playdate-only:
 //            the console tape never references an axis the consoles lack.
 //            The redo stack is cleared by any effective d-pad move/push.
+//            A sub-detent crank remainder belongs to one continuous gesture:
+//            it is dropped on every mode change (chooser open/cancel,
+//            solving, next-level) and on every effective d-pad step, so a
+//            near-detent accumulated in one mode can never fire in another.
+//            B undo is the same undo gesture as anti-clockwise rotation, so
+//            it deliberately keeps the remainder.
 //   SELECT:  d-pad (and crank detents) move the cursor with 24<->1 wrap,
 //            A confirms, B cancels. Restart is two deliberate presses:
 //            A opens the chooser on the current slot and A confirms it,
@@ -162,6 +168,8 @@ export default () => {
     loose.value = 0;
     hist.value = hist.value.slice(0, 0);
     redone.value = redone.value.slice(0, 0);
+    // A level load (confirm, restart or A-next) starts a fresh interaction.
+    crankRemainder.value = 0;
     for (let y = 0; y < BH; y++) {
       const line = rows.value[y];
       if (line) {
@@ -215,12 +223,20 @@ export default () => {
     // restore the level's start exactly.
     if (hist.value.length >= HIST_CAP) return;
     commitMove(dx, dy, pushed);
+    // A self-powered step starts a new interaction: the crank gesture armed
+    // before it must not act on the history this step just wrote.
+    crankRemainder.value = 0;
     const code: any = dc + pushed * 8;
     hist.value.push({ c: code });
     // Moving under your own power invalidates the redo branch, like every
     // editor's undo/redo stack.
     redone.value = redone.value.slice(0, 0);
-    if (loose.value === 0) mode.value = 2;
+    if (loose.value === 0) {
+      // Solving is a mode boundary: the frozen-SOLVED handler ignores the
+      // crank, and leaving it armed would leak into chooser/next-level.
+      crankRemainder.value = 0;
+      mode.value = 2;
+    }
   }
 
   function undo(): void {
@@ -264,15 +280,24 @@ export default () => {
       commitMove(stepDx(code), stepDy(code), stepPushed(code));
       hist.value.push({ c: code });
       redone.value.splice(redone.value.length - 1, 1);
-      if (loose.value === 0) mode.value = 2;
+      if (loose.value === 0) {
+      // Solving is a mode boundary: the frozen-SOLVED handler ignores the
+      // crank, and leaving it armed would leak into chooser/next-level.
+      crankRemainder.value = 0;
+      mode.value = 2;
+    }
     }
   }
 
   function openChooser(): void {
     cursor.value = slot.value;
+    // Entering the chooser starts a new gesture; a MOVE-mode remainder must
+    // not step the cursor on the next millidegree.
+    crankRemainder.value = 0;
     mode.value = 1;
   }
   function cancelChooser(): void {
+    crankRemainder.value = 0;
     mode.value = 0;
   }
   function moveCursor(d: number): void {
@@ -287,6 +312,9 @@ export default () => {
   function advance(): void {
     if (slot.value === LEVEL_COUNT - 1) {
       cursor.value = slot.value;
+      // A mode boundary out of SOLVED: a MOVE-mode near-detent must not wrap
+      // the cursor the moment the chooser appears.
+      crankRemainder.value = 0;
       mode.value = 1;
     } else {
       loadLevel(slot.value + 1);
@@ -397,7 +425,8 @@ export default () => {
         {WIDE ? "MICROBAN (C) DAVID W. SKINNER" : "(C) D.W. SKINNER"}
       </row>
       <row y={HELP_Y} x={1} class="text-slate-500">
-        {WIDE ? "DPAD MOVE   B UNDO   CRANK -/+ UNDO/REDO   A LEVELS" : "B:UND A:LVL CR:UD"}
+        {/* WIDE literal must fit 49 cells (starts at x=1 of the 50-column screen) */}
+        {WIDE ? "DPAD MOVE  B UNDO  CRANK -/+ UNDO REDO  A LEVELS" : "B:UND A:LVL CR:UD"}
       </row>
     </>
   );
