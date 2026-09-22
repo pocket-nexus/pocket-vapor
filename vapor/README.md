@@ -208,11 +208,14 @@ native link; `check` for the variant is frontend-only):
 
 The Playdate variant's extra redo pool and crank-remainder ref account for
 the 4 scalar bytes and larger pools; both files render five paint effects
-with identical masks. **An 83-key tape replays cell-for-cell — characters,
-palettes and decoded VRAM — across the oracle and the GBA, GB and NES
-emulators after every press, with zero runtime tripwires**; a second tape
-crosses the 64-record pool and proves the 65th legal move is refused and 64
-undos restore the level. Key-to-picture settles in **one frame** on GBA.
+over the same row ranges and dependency sets. **An 83-key tape replays
+cell-for-cell — characters, palettes and decoded VRAM — across the oracle
+and the GBA, GB and NES emulators after every press, with zero runtime
+tripwires**; a second tape crosses the 64-record pool and proves the 65th
+legal move is refused and 64 undos restore the level. Under the headless
+harness's key-down convention, GBA key-to-picture settles in **two frames**
+(the frame that polls input keeps the boot picture; the next frame flushes
+the changed cells, independently re-measured 2026-09).
 
 Logic sharing across the two entries is deliberately honest: the P1-d
 local-const import covers data and interfaces only (module helpers are

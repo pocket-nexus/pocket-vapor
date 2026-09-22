@@ -102,7 +102,7 @@ for (const name of ["todo-boot", "todo-active", "todo-edit"]) {
 }
 
 // ---- Sokoban ----------------------------------------------------------------
-// GBA shows slot 1 mid-solve (16 presses of the BFS solution); GB and NES
+// GBA shows slot 1 mid-solve (17 presses of the BFS solution); GB and NES
 // show the boot board with the title/credit chrome, exactly like the todo
 // shots above.
 const SOKOBAN_ENTRY = join(HERE, "..", "examples", "sokoban", "sokoban.tsx");
