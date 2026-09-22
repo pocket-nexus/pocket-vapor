@@ -174,6 +174,63 @@ Vapor in your browser — inspectable DOM rows, keyboard as the pad,
 `?target=esp32` to preview the MeowBit viewport, or `?target=playdate` for
 the 50×30 one-bit contract.
 
+## Pocket Sokoban
+
+The second real workload (after Todo) is a playable **Sokoban**: 24 puzzles
+from David W. Skinner's freely-distributed [Microban](http://sneezingtiger.com/sokoban/levels/microbanText.html)
+set (attribution required and shown on every screen), d-pad movement and
+pushing, a 64-step undo pool, a level chooser and solve detection. Two entry
+files share their level data and record shapes:
+[`examples/sokoban/sokoban.tsx`](examples/sokoban/sokoban.tsx) targets
+GBA/GB/NES/ESP32 and [`sokoban.playdate.tsx`](examples/sokoban/sokoban.playdate.tsx)
+is the Playdate input variant. The only control differences the hardware
+forces: Playdate has no Start/Select, so **A opens the chooser and two A
+presses restart** (open → confirm the current slot), and the **crank scrubs
+undo/redo at one 45° detent per step** — anti-clockwise undo, clockwise
+redo, the redo stack cleared by any fresh move. The board is eight pooled
+10-char string rows (the NES pool holds exactly eight) over a flat
+1920-byte level ROM; undo is a second pool of packed one-byte steps.
+
+| Game Boy Advance (30×20) | Game Boy (sdcc, 20×18) | NES (cc65, 22×18) |
+|---|---|---|
+| ![gba](docs/sokoban-gba.png) | ![gb](docs/sokoban-gb.png) | ![nes](docs/sokoban-nes.png) |
+
+Numbers measured 2026-09 on this machine (compile wall time includes the
+native link; `check` for the variant is frontend-only):
+
+| target | ROM bytes | state RAM (scalars + pools) | overlay | reactive tables | effects | compile |
+|---|---|---|---|---|---|---|
+| GBA | 11444 B `sokoban.gba` | 28 B + 266 B | 65 B / 1 slot | 9 dirty, 5 effects | 5 | ~0.5 s |
+| GB | 32768 B `sokoban.gb` (padded) | 28 B + 266 B | 65 B / 1 slot | 9 dirty, 5 effects | 5 | ~4.6 s |
+| NES | 40976 B `sokoban.nes` (padded) | 28 B + 234 B | 65 B / 1 slot | 9 dirty, 5 effects | 5 | ~0.3 s |
+| ESP32 | check OK (no IDF here to link) | 28 B + 266 B | 65 B / 1 slot | 9 dirty, 5 effects | 5 | — |
+| Playdate | check OK + generated C compiles (`-Werror`); no SDK on this machine, **not built with pdc or run on a device** | 32 B + 331 B | 130 B / 2 slots | 11 dirty, 5 effects | 5 | ~0.3 s (5-target check) |
+
+The Playdate variant's extra redo pool and crank-remainder ref account for
+the 4 scalar bytes and larger pools; both files render five paint effects
+with identical masks. **An 83-key tape replays cell-for-cell — characters,
+palettes and decoded VRAM — across the oracle and the GBA, GB and NES
+emulators after every press, with zero runtime tripwires**; a second tape
+crosses the 64-record pool and proves the 65th legal move is refused and 64
+undos restore the level. Key-to-picture settles in **one frame** on GBA.
+
+Logic sharing across the two entries is deliberately honest: the P1-d
+local-const import covers data and interfaces only (module helpers are
+void, take solely `:number` params, and may touch neither refs nor host
+APIs), so both files import `levels.ts` (the 1920-byte ROM + geometry) and
+`shared.ts` (the `Line`/`Hist` record shapes, layout constants, pads) while
+the ref/`putChar`-driven rule helpers are duplicated text pinned to the same
+oracle semantics — lifting them needs one more compiler extension, recorded
+in `shared.ts`. The console file checks OK on GBA/GB/NES/ESP32; the variant
+checks OK on Playdate (no VT101) and, exactly like `todo.playdate.tsx`,
+reports VT102 on the four axis-less targets since a crank-consuming file has
+no adapter there.
+
+Levels: **Microban Copyright © David W. Skinner**
+(sasquatch@bentonrea.com), carried with attribution; source URL and the
+per-slot selection rationale are in the header of
+[`examples/sokoban/levels.ts`](examples/sokoban/levels.ts).
+
 ## Commands
 
 The ESP32 `flash` and default `verify` commands below write the connected
@@ -186,6 +243,8 @@ board; make a full-flash backup first as described in
 bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx                 # → dist/vapor/todo.gba
 bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx --target gb     # → todo.gb  (32 KB)
 bun vapor/compiler/cli.ts vapor/examples/todo/todo.tsx --target nes    # → todo.nes (40 KB)
+bun vapor/compiler/cli.ts check vapor/examples/sokoban/sokoban.tsx           # GBA/GB/NES/ESP32 OK
+bun vapor/compiler/cli.ts check vapor/examples/sokoban/sokoban.playdate.tsx  # Playdate OK (VT102 on consoles)
 bun run vapor:esp32                                        # → app-only todo.esp32.bin + gen-esp32/
 bun run vapor:playdate                                     # → crank-driven Todo Simulator .pdx
 bun run vapor:playdate:device                              # → crank-driven Todo device .pdx
@@ -221,6 +280,7 @@ arithmetic and bit masks come from a ROM table.
 vapor/
   DESIGN.md            the thesis + subset + target/style contracts
   examples/todo/       portable Todo + Playdate relative-axis input variant
+  examples/sokoban/    Microban Sokoban + Playdate crank variant (shared.ts/levels.ts)
   host/                input.ts (buttons + relative axes), screen.ts (SCREEN geometry)
   oracle/              micro-DOM + grid painter + bundle boot (real vue)
   compiler/            compile.ts (TS AST → C), styles.ts (class DSL), rom.ts, cli.ts
