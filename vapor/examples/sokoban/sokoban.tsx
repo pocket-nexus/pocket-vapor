@@ -13,6 +13,16 @@
 //     u8 field): 3 bits per step — a direction code 1..4 plus a push flag
 //     (add 8). A 64-deep stack then costs 65 B on NES, the only shape that
 //     links beside the 8-row string board in the 6502 BSS window.
+//
+//     FULL-HISTORY POLICY: the pool is a fixed 64 records on device (the JS
+//     oracle array is unbounded, so the policy must live in app code, not in
+//     a pool tripwire). When it already holds 64, the next OTHERWISE-LEGAL
+//     move is REFUSED before any state changes: the board, move count and
+//     solved flag stay put and a "HIST FULL" line asks the player to undo.
+//     Blocked presses still return earlier, so bumping a wall at the cap is
+//     the same silent no-op as ever. Refusing (rather than dropping the
+//     oldest record) keeps the very first move reversible, so 64 undos from
+//     the cap restore the level exactly.
 //   - LEVEL SELECT: Select opens a chooser; Left/Up/L step -1 and
 //     Right/Down/R step +1 with 24<->1 wrap; A/Start load the picked slot
 //     (picking the current slot restarts it), B/Select cancel. Start in
@@ -53,6 +63,10 @@ type Keymap = Record<number, () => void>;
 const BOARD_Y = 2;
 const BANNER_Y = 11;
 const PROMPT_Y = 12;
+// Fixed depth of the undo pool (withCapacity below). The full-history policy
+// refuses the 65th recorded move, so the app itself never lets the bounded
+// pool overflow; VP_TRIP_POOL_FULL cannot fire from a legal game.
+const HIST_CAP = 64;
 // The per-screen board origin (PD 20 / GBA 10 / NES 6 / GB 5) is a leading
 // pad child rather than an x= offset (the x attribute folds constants only).
 const PAD_50 = "                    ";
@@ -84,7 +98,7 @@ export default () => {
       BH,
     ),
   );
-  const hist = ref<Hist[]>(withCapacity([], 64));
+  const hist = ref<Hist[]>(withCapacity([], HIST_CAP));
   const px = ref(4);
   const py = ref(3);
   const moves = ref(0);
@@ -193,10 +207,17 @@ export default () => {
     const ahead = cellKind(nx, ny);
     if (ahead === 1) return; // wall
     const pushed = ahead === 2 ? 1 : 0;
+    const bx = nx + dx;
+    const by = ny + dy;
     if (pushed === 1) {
-      const bx = nx + dx;
-      const by = ny + dy;
       if (cellKind(bx, by) !== 0) return; // box blocked by box/wall/edge
+    }
+    // Full-history policy: the move is known legal above; refuse it BEFORE
+    // mutating anything once the undo pool is saturated, so the recorded
+    // inverses always cover the whole reachable session (64 undos restore
+    // the start). Runs identically under the oracle and on device.
+    if (hist.value.length >= HIST_CAP) return;
+    if (pushed === 1) {
       // Track the pushed box against goal terrain (the loose count only
       // changes when a box crosses onto/off a goal).
       const boxWasLoose = isGoal(nx, ny) === 1 ? 0 : 1;
@@ -337,6 +358,12 @@ export default () => {
       {mode.value === 1 ? (
         <row y={PROMPT_Y} class="text-slate-400 align-center">
           {WIDE ? "<> CHOOSE  A:OK  B:BACK" : "<> PICK A OK B BACK"}
+        </row>
+      ) : null}
+
+      {mode.value === 0 && hist.value.length >= HIST_CAP ? (
+        <row y={10} class="bg-amber-300 text-slate-950 align-center">
+          {WIDE ? "HISTORY FULL - PRESS B TO UNDO" : "HIST FULL"}
         </row>
       ) : null}
 
