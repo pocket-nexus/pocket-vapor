@@ -1,49 +1,43 @@
-// POCKET SOKOBAN — slice P2②: undo, level select, solve detection.
+// POCKET SOKOBAN — PLAYDATE INPUT VARIANT (slice P2④).
 //
-// Same two-life design as todo.tsx: under the oracle this runs unmodified on
-// real Vue Vapor; the Pocket Vapor compiler lowers it to C for GBA/GB/NES/
-// ESP32. (The Playdate input variant lives in sokoban.playdate.tsx.) The
-// board is 8 pooled STRING records (one 10-char row each, NES's board pool
-// holds exactly 8). Walls and goals are the static terrain read from the
-// flat LEVEL_ROM const (sokoban/levels.ts); the player and boxes are written
-// in place with putChar.
+// Same game as sokoban.tsx on the Playdate's six physical buttons plus the
+// crank. The console file binds undo to B, restart to Start and the chooser
+// to Select; Playdate has no Start/Select/L/R (VT101 rejects any static
+// reference to them), so the missing controls land like this (S2 §3.2):
 //
-// Record shapes, geometry and pads are shared with the Playdate variant via
-// sokoban/shared.ts (a P1-d local const module). The rule helpers cannot be
-// shared: see shared.ts for the module-subset boundary that blocks it.
+//   MOVE:    d-pad move/push, B undo, A open the level chooser,
+//            CRANK = undo/redo scrub — one 45-degree detent per step,
+//            anti-clockwise undo, clockwise REDO. Redo is Playdate-only:
+//            the console tape never references an axis the consoles lack.
+//            The redo stack is cleared by any effective d-pad move/push.
+//   SELECT:  d-pad (and crank detents) move the cursor with 24<->1 wrap,
+//            A confirms, B cancels. Restart is two deliberate presses:
+//            A opens the chooser on the current slot and A confirms it,
+//            and loading the current slot rebuilds it.
+//   SOLVED:  A loads the next level; every other input, the crank included,
+//            is frozen.
 //
-// This slice adds, on top of P2①'s board/movement:
-//   - UNDO: B reverses one move, pulling a pushed box back with the player.
-//     The history is a second pooled list of ONE-BYTE records (a single
-//     u8 field): 3 bits per step — a direction code 1..4 plus a push flag
-//     (add 8). A 64-deep stack then costs 65 B on NES, the only shape that
-//     links beside the 8-row string board in the 6502 BSS window.
+// SHARING WITH sokoban.tsx: record shapes (Line/Hist), geometry and pads
+// come from ./shared.ts and the 24-level LEVEL_ROM comes from ./levels.ts
+// (both P1-d local const modules). The rule helpers below are duplicated
+// text: module helpers are void, take only `:number` params and may touch
+// neither refs nor host APIs, so the ref/putChar-driven rules cannot be
+// lifted into a module without a further compiler extension. shared.ts
+// records that boundary; oracle tests pin both entries to the same
+// movement semantics.
 //
-//     FULL-HISTORY POLICY: the pool is a fixed 64 records on device (the JS
-//     oracle array is unbounded, so the policy must live in app code, not in
-//     a pool tripwire). When it already holds 64, the next OTHERWISE-LEGAL
-//     move is REFUSED before any state changes: the board, move count and
-//     solved flag stay put and a "HIST FULL" line asks the player to undo.
-//     Blocked presses still return earlier, so bumping a wall at the cap is
-//     the same silent no-op as ever. Refusing (rather than dropping the
-//     oldest record) keeps the very first move reversible, so 64 undos from
-//     the cap restore the level exactly.
-//   - LEVEL SELECT: Select opens a chooser; Left/Up/L step -1 and
-//     Right/Down/R step +1 with 24<->1 wrap; A/Start load the picked slot
-//     (picking the current slot restarts it), B/Select cancel. Start in
-//     play restarts the current level; the board is rebuilt cell-by-cell
-//     from LEVEL_ROM.
-//   - SOLVED: a count of boxes still off a goal drives the SOLVED banner;
-//     in SOLVED every button but A is frozen, and A loads the next level
-//     (after the last level it returns to the chooser).
-//
-// Three keymaps (MOVE / SELECT / SOLVED) are selected per press by mode.
-//
-// Controls (play): Up/Down/Left/Right move/push, B undo, Start restart,
-// Select open the chooser.
+// No Playdate SDK is installed in this environment: this file is proven by
+// the compile-time admission check (check: playdate OK, no VT101) and the
+// generated C; it has NOT been built with pdc or run on a device.
 
 import { ref, computed } from "vue";
-import { Button, onButton } from "../../host/input.ts";
+import {
+  Button,
+  onAxisDelta,
+  onButton,
+  RelativeAxis,
+  RelativeAxisUnits,
+} from "../../host/input.ts";
 import { SCREEN } from "../../host/screen.ts";
 import { putChar } from "../../host/text.ts";
 import { withCapacity } from "../../host/list.ts";
@@ -66,13 +60,13 @@ type Keymap = Record<number, () => void>;
 const WIDE = SCREEN.width >= 30;
 const HELP_Y = SCREEN.height - 1;
 const CREDIT_Y = SCREEN.height - 2;
+// One crank detent is 45 degrees; signed millidegrees are the canonical axis
+// unit. The app owns the detent, the host only preserves rotation.
+const CRANK_DETENT = 45 * RelativeAxisUnits.PerDegree;
 
 // ---- app --------------------------------------------------------------------
 
 export default () => {
-  // Slot 1 (Microban #1) as it sits in its centred 10x8 ROM block. The seed
-  // is the mutable dynamic layer for boot only; loadLevel() rebuilds it from
-  // LEVEL_ROM for every restart/select/advance.
   const rows = ref<Line[]>(
     withCapacity(
       [
@@ -89,16 +83,18 @@ export default () => {
     ),
   );
   const hist = ref<Hist[]>(withCapacity([], HIST_CAP));
+  // Playdate-only forward stack: crank anti-clockwise pops `hist` onto it,
+  // clockwise replays from it. Same packed one-byte step records.
+  const redone = ref<Hist[]>(withCapacity([], HIST_CAP));
   const px = ref(4);
   const py = ref(3);
   const moves = ref(0);
-  const slot = ref(0); // 0-based play slot
+  const slot = ref(0);
   const mode = ref(0); // 0 MOVE, 1 SELECT (chooser), 2 SOLVED
-  const cursor = ref(0); // chooser slot
-  const loose = ref(1); // boxes not yet on a goal; 0 == solved
+  const cursor = ref(0);
+  const loose = ref(1);
+  const crankRemainder = ref(0); // sub-detent millidegrees carried frames
 
-  // Classify a DYNAMIC board cell: 1 wall, 2 box ($ or *), 0 enterable.
-  // Pure: reads only, so it compiles to one s32 function with no dirty bit.
   function cellKind(x: number, y: number): number {
     if (x >= 0 && y >= 0 && x < BW && y < BH) {
       const line = rows.value[y];
@@ -110,7 +106,6 @@ export default () => {
     return 0;
   }
 
-  // Classify the STATIC terrain: 1 goal cell (. * +), 0 plain floor/void.
   function isGoal(x: number, y: number): number {
     if (x >= 0 && y >= 0 && x < BW && y < BH) {
       const off = slot.value * STRIDE + y * BW + x;
@@ -119,7 +114,6 @@ export default () => {
     return 0;
   }
 
-  // Decode a packed history byte. Pure arithmetic, no reactive graph.
   function stepDx(code: number): number {
     const d = code % 8;
     if (d === 2) return -1;
@@ -161,24 +155,18 @@ export default () => {
     }
   }
 
-  // Rebuild the board for slot s from LEVEL_ROM. Canonical for-loops with
-  // putChar only (string clear/concat are outside the subset); the rows are
-  // pre-seeded to ten spaces so every byte index is in range. The same pass
-  // locates the player and counts boxes off a goal.
   function loadLevel(s: number): void {
     slot.value = s;
     moves.value = 0;
     mode.value = 0;
     loose.value = 0;
     hist.value = hist.value.slice(0, 0);
+    redone.value = redone.value.slice(0, 0);
     for (let y = 0; y < BH; y++) {
       const line = rows.value[y];
       if (line) {
         for (let x = 0; x < BW; x++) {
           const off = s * STRIDE + y * BW + x;
-          // char locals are outside the subset; the ROM byte is indexed
-          // inline (putChar takes a char; char-vs-literal compares lower to
-          // C char constants).
           line.text = putChar(line.text, x, LEVEL_ROM[off]);
           if (LEVEL_ROM[off] === "@" || LEVEL_ROM[off] === "+") {
             px.value = x;
@@ -191,25 +179,15 @@ export default () => {
     }
   }
 
-  function step(dx: number, dy: number, dc: number): void {
+  // Apply one already-vetted movement (shared by live d-pad steps and crank
+  // redo). nx/ny are in bounds and enterable; pushed says whether a box at
+  // nx,ny moves to bx,by.
+  function commitMove(dx: number, dy: number, pushed: number): void {
     const nx = px.value + dx;
     const ny = py.value + dy;
-    const ahead = cellKind(nx, ny);
-    if (ahead === 1) return; // wall
-    const pushed = ahead === 2 ? 1 : 0;
-    const bx = nx + dx;
-    const by = ny + dy;
     if (pushed === 1) {
-      if (cellKind(bx, by) !== 0) return; // box blocked by box/wall/edge
-    }
-    // Full-history policy: the move is known legal above; refuse it BEFORE
-    // mutating anything once the undo pool is saturated, so the recorded
-    // inverses always cover the whole reachable session (64 undos restore
-    // the start). Runs identically under the oracle and on device.
-    if (hist.value.length >= HIST_CAP) return;
-    if (pushed === 1) {
-      // Track the pushed box against goal terrain (the loose count only
-      // changes when a box crosses onto/off a goal).
+      const bx = nx + dx;
+      const by = ny + dy;
       const boxWasLoose = isGoal(nx, ny) === 1 ? 0 : 1;
       const boxNowLoose = isGoal(bx, by) === 1 ? 0 : 1;
       loose.value = loose.value + boxNowLoose - boxWasLoose;
@@ -221,13 +199,32 @@ export default () => {
     px.value = nx;
     py.value = ny;
     moves.value = moves.value + 1;
+  }
+
+  function step(dx: number, dy: number, dc: number): void {
+    const nx = px.value + dx;
+    const ny = py.value + dy;
+    const ahead = cellKind(nx, ny);
+    if (ahead === 1) return;
+    const pushed = ahead === 2 ? 1 : 0;
+    if (pushed === 1) {
+      if (cellKind(nx + dx, ny + dy) !== 0) return;
+    }
+    // Full-history policy, identical to the console build: a legal move at
+    // the cap is refused before anything changes, so 64 crank/B undos still
+    // restore the level's start exactly.
+    if (hist.value.length >= HIST_CAP) return;
+    commitMove(dx, dy, pushed);
     const code: any = dc + pushed * 8;
     hist.value.push({ c: code });
+    // Moving under your own power invalidates the redo branch, like every
+    // editor's undo/redo stack.
+    redone.value = redone.value.slice(0, 0);
     if (loose.value === 0) mode.value = 2;
   }
 
   function undo(): void {
-    if (mode.value !== 0) return; // frozen while solved; chooser handles B itself
+    if (mode.value !== 0) return;
     if (hist.value.length === 0) return;
     const top = hist.value[hist.value.length - 1];
     if (top) {
@@ -235,9 +232,6 @@ export default () => {
       const dx = stepDx(code);
       const dy = stepDy(code);
       const pushed = stepPushed(code);
-      // Player stands where the box was pushed to-adjacent; reverse the
-      // move: free the player cell, pull the box back if pushed, then move
-      // the player to the cell behind.
       paintFloor(px.value, py.value);
       if (pushed === 1) {
         const boxX = px.value + dx;
@@ -252,7 +246,25 @@ export default () => {
       py.value = py.value - dy;
       paintPlayer(px.value, py.value);
       moves.value = moves.value - 1;
+      // The reversed step becomes available to clockwise redo.
+      redone.value.push({ c: code });
       hist.value.splice(hist.value.length - 1, 1);
+    }
+  }
+
+  // Replay one undone packed step. History only ever records legal moves and
+  // undo exactly reverses them, so the replayed collision gates cannot fail;
+  // redone being non-empty likewise guarantees hist.length < HIST_CAP.
+  function redo(): void {
+    if (mode.value !== 0) return;
+    if (redone.value.length === 0) return;
+    const top = redone.value[redone.value.length - 1];
+    if (top) {
+      const code: any = top.c;
+      commitMove(stepDx(code), stepDy(code), stepPushed(code));
+      hist.value.push({ c: code });
+      redone.value.splice(redone.value.length - 1, 1);
+      if (loose.value === 0) mode.value = 2;
     }
   }
 
@@ -272,12 +284,8 @@ export default () => {
   function confirmChooser(): void {
     loadLevel(cursor.value);
   }
-  function restart(): void {
-    loadLevel(slot.value);
-  }
   function advance(): void {
     if (slot.value === LEVEL_COUNT - 1) {
-      // after the final level, return to the chooser
       cursor.value = slot.value;
       mode.value = 1;
     } else {
@@ -291,25 +299,47 @@ export default () => {
     [Button.Down]: () => step(0, 1, 3),
     [Button.Right]: () => step(1, 0, 4),
     [Button.B]: undo,
-    [Button.Start]: restart,
-    [Button.Select]: openChooser,
+    [Button.A]: openChooser,
   };
   const selectKeys: Keymap = {
     [Button.Left]: () => moveCursor(-1),
     [Button.Up]: () => moveCursor(-1),
-    [Button.L]: () => moveCursor(-1),
     [Button.Right]: () => moveCursor(1),
     [Button.Down]: () => moveCursor(1),
-    [Button.R]: () => moveCursor(1),
     [Button.A]: confirmChooser,
-    [Button.Start]: confirmChooser,
     [Button.B]: cancelChooser,
-    [Button.Select]: cancelChooser,
   };
   const solvedKeys: Keymap = {
     [Button.A]: advance,
   };
   onButton((b) => (mode.value === 2 ? solvedKeys : mode.value === 1 ? selectKeys : moveKeys)[b]?.());
+
+  // Crank: in MOVE the detents scrub undo (anti-clockwise) and redo
+  // (clockwise); in the chooser they step the cursor (wrap handled per
+  // detent); SOLVED ignores rotation entirely. Sub-45-degree motion stays in
+  // crankRemainder, so two 30-degree ticks make one step.
+  onAxisDelta(RelativeAxis.Primary, (delta) => {
+    if (mode.value !== 2) {
+      crankRemainder.value = crankRemainder.value + delta;
+      const steps = Math.trunc(crankRemainder.value / CRANK_DETENT);
+      if (steps !== 0) {
+        crankRemainder.value = crankRemainder.value % CRANK_DETENT;
+        if (mode.value === 1) {
+          if (steps > 0) {
+            for (let i = 0; i < steps; i++) moveCursor(1);
+          } else {
+            for (let i = 0; i < 0 - steps; i++) moveCursor(-1);
+          }
+        } else {
+          if (steps > 0) {
+            for (let i = 0; i < steps; i++) redo();
+          } else {
+            for (let i = 0; i < 0 - steps; i++) undo();
+          }
+        }
+      }
+    }
+  });
 
   return (
     <>
@@ -353,7 +383,7 @@ export default () => {
 
       {mode.value === 0 && hist.value.length >= HIST_CAP ? (
         <row y={10} class="bg-amber-300 text-slate-950 align-center">
-          {WIDE ? "HISTORY FULL - PRESS B TO UNDO" : "HIST FULL"}
+          {WIDE ? "HISTORY FULL - TURN CRANK OR PRESS B TO UNDO" : "HIST FULL"}
         </row>
       ) : null}
 
@@ -367,7 +397,7 @@ export default () => {
         {WIDE ? "MICROBAN (C) DAVID W. SKINNER" : "(C) D.W. SKINNER"}
       </row>
       <row y={HELP_Y} x={1} class="text-slate-500">
-        {WIDE ? "^v<>MOVE B:UNDO ST:RST SEL:LVL" : "B:UND ST:RST SE:LVL"}
+        {WIDE ? "DPAD MOVE   B UNDO   CRANK -/+ UNDO/REDO   A LEVELS" : "B:UND A:LVL CR:UD"}
       </row>
     </>
   );
