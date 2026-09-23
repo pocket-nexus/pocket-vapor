@@ -300,6 +300,35 @@ describe("sokoban playdate: crank remainder dies at mode and level boundaries", 
     o.unmount();
   });
 
+  test("an effective chooser d-pad step drops the pending remainder (both signs)", async () => {
+    // Review 1293: a near-detent armed inside the chooser must not survive an
+    // effective d-pad cursor step. Clockwise: +44999, Left (01->24), +1mdeg
+    // must stay on 24 instead of completing the old detent back to 01.
+    {
+      const o = await boot();
+      await o.press(Button.A); // chooser on 01
+      await o.axisDelta(RelativeAxis.Primary, DETENT - 1); // no cursor step yet
+      expect(rowText(o, BANNER_Y)).toContain("LEVEL 01/24");
+      await o.press(Button.Left); // effective d-pad step: 01 -> 24
+      expect(rowText(o, BANNER_Y)).toContain("LEVEL 24/24");
+      await o.axisDelta(RelativeAxis.Primary, 1); // old remainder would wrap to 01
+      expect(rowText(o, BANNER_Y)).toContain("LEVEL 24/24");
+      o.unmount();
+    }
+    // Anti-clockwise sign: -44999, Right (01->02), -1mdeg stays on 02.
+    {
+      const o = await boot();
+      await o.press(Button.A);
+      await o.axisDelta(RelativeAxis.Primary, NEARLY);
+      expect(rowText(o, BANNER_Y)).toContain("LEVEL 01/24");
+      await o.press(Button.Right); // effective d-pad step: 01 -> 02
+      expect(rowText(o, BANNER_Y)).toContain("LEVEL 02/24");
+      await o.axisDelta(RelativeAxis.Primary, -1); // old remainder would wrap to 01
+      expect(rowText(o, BANNER_Y)).toContain("LEVEL 02/24");
+      o.unmount();
+    }
+  });
+
   test("B undo is the same gesture as anti-clockwise crank: it keeps the remainder", async () => {
     const o = await boot();
     await o.press(Button.Up);
