@@ -101,6 +101,15 @@ export default () => {
   const loose = ref(1);
   const crankRemainder = ref(0); // sub-detent millidegrees carried frames
 
+  // The sub-detent crank remainder belongs to one continuous gesture.
+  // Every effective d-pad step and every mode/level boundary ends that
+  // gesture, and they all end it here so a near-detent can never survive an
+  // input transition. B undo is deliberately routed around this: it is the
+  // same gesture as anti-clockwise rotation.
+  function newGesture(): void {
+    crankRemainder.value = 0;
+  }
+
   function cellKind(x: number, y: number): number {
     if (x >= 0 && y >= 0 && x < BW && y < BH) {
       const line = rows.value[y];
@@ -169,7 +178,7 @@ export default () => {
     hist.value = hist.value.slice(0, 0);
     redone.value = redone.value.slice(0, 0);
     // A level load (confirm, restart or A-next) starts a fresh interaction.
-    crankRemainder.value = 0;
+    newGesture();
     for (let y = 0; y < BH; y++) {
       const line = rows.value[y];
       if (line) {
@@ -225,7 +234,7 @@ export default () => {
     commitMove(dx, dy, pushed);
     // A self-powered step starts a new interaction: the crank gesture armed
     // before it must not act on the history this step just wrote.
-    crankRemainder.value = 0;
+    newGesture();
     const code: any = dc + pushed * 8;
     hist.value.push({ c: code });
     // Moving under your own power invalidates the redo branch, like every
@@ -234,7 +243,7 @@ export default () => {
     if (loose.value === 0) {
       // Solving is a mode boundary: the frozen-SOLVED handler ignores the
       // crank, and leaving it armed would leak into chooser/next-level.
-      crankRemainder.value = 0;
+      newGesture();
       mode.value = 2;
     }
   }
@@ -281,11 +290,11 @@ export default () => {
       hist.value.push({ c: code });
       redone.value.splice(redone.value.length - 1, 1);
       if (loose.value === 0) {
-      // Solving is a mode boundary: the frozen-SOLVED handler ignores the
-      // crank, and leaving it armed would leak into chooser/next-level.
-      crankRemainder.value = 0;
-      mode.value = 2;
-    }
+        // Solving is a mode boundary: the frozen-SOLVED handler ignores the
+        // crank, and leaving it armed would leak into chooser/next-level.
+        newGesture();
+        mode.value = 2;
+      }
     }
   }
 
@@ -293,11 +302,11 @@ export default () => {
     cursor.value = slot.value;
     // Entering the chooser starts a new gesture; a MOVE-mode remainder must
     // not step the cursor on the next millidegree.
-    crankRemainder.value = 0;
+    newGesture();
     mode.value = 1;
   }
   function cancelChooser(): void {
-    crankRemainder.value = 0;
+    newGesture();
     mode.value = 0;
   }
   function moveCursor(d: number): void {
@@ -314,26 +323,47 @@ export default () => {
       cursor.value = slot.value;
       // A mode boundary out of SOLVED: a MOVE-mode near-detent must not wrap
       // the cursor the moment the chooser appears.
-      crankRemainder.value = 0;
+      newGesture();
       mode.value = 1;
     } else {
       loadLevel(slot.value + 1);
     }
   }
 
+  // Single entry for every effective d-pad direction step, in both MOVE and
+  // SELECT, so the gesture boundary lives in one place instead of being
+  // re-cleared at each call site. In SELECT a cursor step is always
+  // effective, so it starts a new gesture before moving. In MOVE the step is
+  // effective only once step() passes the wall/history gates, so step() owns
+  // the newGesture() call and a wall bump keeps the remainder. The crank
+  // detent loop deliberately does NOT route through here: a detent continues
+  // the same gesture, so it calls moveCursor/undo/redo directly.
+  function dpadStep(code: number): void {
+    if (mode.value === 1) {
+      newGesture();
+      if (code === 1 || code === 2) moveCursor(-1);
+      else moveCursor(1);
+    } else {
+      if (code === 1) step(0, -1, 1);
+      else if (code === 2) step(-1, 0, 2);
+      else if (code === 3) step(0, 1, 3);
+      else step(1, 0, 4);
+    }
+  }
+
   const moveKeys: Keymap = {
-    [Button.Up]: () => step(0, -1, 1),
-    [Button.Left]: () => step(-1, 0, 2),
-    [Button.Down]: () => step(0, 1, 3),
-    [Button.Right]: () => step(1, 0, 4),
+    [Button.Up]: () => dpadStep(1),
+    [Button.Left]: () => dpadStep(2),
+    [Button.Down]: () => dpadStep(3),
+    [Button.Right]: () => dpadStep(4),
     [Button.B]: undo,
     [Button.A]: openChooser,
   };
   const selectKeys: Keymap = {
-    [Button.Left]: () => moveCursor(-1),
-    [Button.Up]: () => moveCursor(-1),
-    [Button.Right]: () => moveCursor(1),
-    [Button.Down]: () => moveCursor(1),
+    [Button.Left]: () => dpadStep(2),
+    [Button.Up]: () => dpadStep(1),
+    [Button.Right]: () => dpadStep(4),
+    [Button.Down]: () => dpadStep(3),
     [Button.A]: confirmChooser,
     [Button.B]: cancelChooser,
   };
