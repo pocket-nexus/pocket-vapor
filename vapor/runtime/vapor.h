@@ -88,6 +88,12 @@ u8 vp_sb_eq(const vp_sb *a, const vp_sb *b);
 #define VP_TRIP_STR_TRUNC 2
 #define VP_TRIP_VIEW_FULL 4
 #define VP_TRIP_PLATFORM_RENDER 8
+/* putChar into an out-of-range record string index: no byte is written. */
+#define VP_TRIP_INDEX 16
+/* field write through a record pointer that is null because the pool index
+ * was out of range: the write is skipped. Real Vue throws TypeError there;
+ * an unguarded dereference of address 0 hangs the GBA. */
+#define VP_TRIP_NULL 32
 extern u8 vp_tripwires;
 
 /* core state shared with the per-target runtime */
@@ -112,7 +118,9 @@ u16 app_debug_state(volatile u8 *out); /* mirror reactive state; returns bytes *
  *   NES: vp_font_tiles (2 styles x 95) x 16B 2bpp planar
  *   ESP32: vp_font_tiles 95x8B 1bpp, direct RGB565 ink/paper tables
  *   Playdate: vp_font_tiles 95x8B 1bpp, vp_pal_style maps pair -> normal/inverse
- *   GB/NES/Playdate: vp_pal_style maps logical palette -> glyph style (0/1) */
+ *   GB/NES/Playdate: vp_pal_style maps logical palette -> glyph style (0/1).
+ * The cartridge title is not a C symbol: rom.ts patches header bytes on GBA/GB
+ * and Playdate takes it from bundle metadata. */
 extern const u8 vp_font_tiles[];
 extern const u16 vp_palettes[];
 extern const u8 vp_palette_count;
@@ -120,6 +128,5 @@ extern const u16 vp_backdrop;
 extern const u16 vp_ink565[];
 extern const u16 vp_paper565[];
 extern const u8 vp_pal_style[];
-extern const char vp_app_title[]; /* cartridge title, <= 12 chars */
 
 #endif

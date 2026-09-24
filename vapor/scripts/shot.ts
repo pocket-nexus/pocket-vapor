@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
-// vapor/scripts/shot.ts — bake PNG screenshots of the todo ROM for the docs.
+// vapor/scripts/shot.ts — bake PNG screenshots of the todo and sokoban ROMs
+// for the docs.
 //   bun vapor/scripts/shot.ts
-// Builds the ROM, replays a short tape in headless libmgba, and writes
-// 3x-nearest-neighbour PNGs to vapor/docs/.
+// Builds each ROM, replays a short tape in the headless runner (libmgba for
+// GBA/GB, jsnes for NES), and writes 3x-nearest-neighbour PNGs to
+// vapor/docs/.
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -97,4 +99,49 @@ for (const name of ["todo-boot", "todo-active", "todo-edit"]) {
   await $`bun ${join(HERE, "..", "tests", "harness", "nes_runner.ts")} ${nesRom} ${sc}`.quiet();
   await ppmToPng(join(OUT, "shots", "todo-nes.ppm"), join(DOCS, "todo-nes.png"));
   console.log(join(DOCS, "todo-nes.png"));
+}
+
+// ---- Sokoban ----------------------------------------------------------------
+// GBA shows slot 1 mid-solve (17 presses of the BFS solution); GB and NES
+// show the boot board with the title/credit chrome, exactly like the todo
+// shots above.
+const SOKOBAN_ENTRY = join(HERE, "..", "examples", "sokoban", "sokoban.tsx");
+const SOKOBAN_KEY: Record<string, number> = {
+  U: Button.Up,
+  D: Button.Down,
+  L: Button.Left,
+  R: Button.Right,
+};
+{
+  const app = compileVaporApp(SOKOBAN_ENTRY, await Bun.file(SOKOBAN_ENTRY).text(), "SOKOBAN");
+  const rom = join(OUT, "sokoban.gba");
+  await buildGbaRom(app, rom);
+  const lines = ["A 6"];
+  for (const ch of "DLURRRDLULLDDRULU") lines.push(press(SOKOBAN_KEY[ch]));
+  lines.push(`S ${OUT}/shots/sokoban-gba.ppm`);
+  const scenario = join(OUT, "shot-sokoban-gba.txt");
+  await Bun.write(scenario, lines.join("\n") + "\n");
+  await $`${RUNNER} ${rom} ${scenario}`.quiet();
+  await ppmToPng(join(OUT, "shots", "sokoban-gba.ppm"), join(DOCS, "sokoban-gba.png"));
+  console.log(join(DOCS, "sokoban-gba.png"));
+}
+{
+  const gbApp = compileVaporApp(SOKOBAN_ENTRY, await Bun.file(SOKOBAN_ENTRY).text(), "SOKOBAN", "gb");
+  const gbRom = join(OUT, "sokoban.gb");
+  await buildGbRom(gbApp, gbRom);
+  const sc = join(OUT, "shot-sokoban-gb.txt");
+  await Bun.write(sc, `A 120\nS ${OUT}/shots/sokoban-gb.ppm\n`);
+  await $`${RUNNER} ${gbRom} ${sc}`.quiet();
+  await ppmToPng(join(OUT, "shots", "sokoban-gb.ppm"), join(DOCS, "sokoban-gb.png"));
+  console.log(join(DOCS, "sokoban-gb.png"));
+}
+{
+  const nesApp = compileVaporApp(SOKOBAN_ENTRY, await Bun.file(SOKOBAN_ENTRY).text(), "SOKOBAN", "nes");
+  const nesRom = join(OUT, "sokoban.nes");
+  await buildNesRom(nesApp, nesRom);
+  const sc = join(OUT, "shot-sokoban-nes.txt");
+  await Bun.write(sc, `A 10\nS ${OUT}/shots/sokoban-nes.ppm\n`);
+  await $`bun ${join(HERE, "..", "tests", "harness", "nes_runner.ts")} ${nesRom} ${sc}`.quiet();
+  await ppmToPng(join(OUT, "shots", "sokoban-nes.ppm"), join(DOCS, "sokoban-nes.png"));
+  console.log(join(DOCS, "sokoban-nes.png"));
 }

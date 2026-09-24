@@ -3,7 +3,7 @@
 //
 //   bun vapor/test/harness/nes_runner.ts <rom.nes> <scenario.txt>
 //
-// Same line protocol as mgba_runner (A/P/R/D/S), with one deliberate
+// Same line protocol as mgba_runner (A/K/P/R/D/S), with one deliberate
 // difference carried over from Pocket Static: A/P counts are ENGINE TICKS,
 // not video frames — cc65 code can take several video frames per main-loop
 // iteration, so the runner paces on the debug block's frame counter at
@@ -55,6 +55,13 @@ const BUTTONS: [number, ButtonKey][] = [
   [1 << 7, Controller.BUTTON_DOWN],
 ];
 
+function setKeys(mask: number): void {
+  for (const [key, button] of BUTTONS) {
+    if (mask & key) nes.buttonDown(1, button);
+    else nes.buttonUp(1, button);
+  }
+}
+
 async function screenshot(path: string): Promise<void> {
   if (!frameBuffer) return;
   const w = 256;
@@ -79,12 +86,14 @@ try {
     const op = line[0];
     if (op === "A") {
       advanceTicks(Number(line.slice(1).trim()));
+    } else if (op === "K") {
+      setKeys(parseInt(line.slice(1).trim(), 16));
     } else if (op === "P") {
       const [maskHex, hold, release] = line.slice(1).trim().split(/\s+/);
       const mask = parseInt(maskHex, 16);
-      for (const [k, btn] of BUTTONS) if (mask & k) nes.buttonDown(1, btn);
+      setKeys(mask);
       advanceTicks(Number(hold));
-      for (const [k, btn] of BUTTONS) if (mask & k) nes.buttonUp(1, btn);
+      setKeys(0);
       advanceTicks(Number(release));
     } else if (op === "R") {
       const [name, addrHex, size] = line.slice(1).trim().split(/\s+/);
