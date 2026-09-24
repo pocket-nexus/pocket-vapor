@@ -17,6 +17,8 @@
 // arms), which can only cause redundant repaints, never a missed one.
 
 import ts from "typescript";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { FONT8 } from "./font.gen.ts";
 import { sccpRefConstants } from "./sccp.ts";
 import { rgb555, rgb565, StyleTable, type StyleIssue } from "./styles.ts";
@@ -101,16 +103,27 @@ type Ty =
   | { k: "char" }
   | { k: "strlit" } // C `const char *`
   | { k: "sb" } // C `const vp_sb *`
-  | { k: "obj"; iface: string; listRef: string } // nullable record pointer
-  | { k: "view"; iface: string; listRef: string; maxLen: number }
+  | { k: "obj"; iface: string; listRef: string; nullable: boolean } // record pointer (nullable when from a pool index)
+  | { k: "view"; iface: string; listRef: string; maxLen: number; cap: number }
   | { k: "void" };
 
 const NUM: Ty = { k: "num" };
 const BOOL: Ty = { k: "bool" };
 
 interface IfaceShape {
-  name: string;
+  name: string; // declared name, for diagnostics
+  /** Unique identity and C struct suffix. In-file interfaces keep the bare
+   * lowercased name (`cell`); an interface declared in imported module idx N
+   * is qualified (`m0_cell`) so two modules may export same-named shapes. */
+  id: string;
   fields: { name: string; ty: "str" | "bool" | "num" }[];
+}
+
+/** An exported interface carries no runtime binding; it only maps the
+ * importer's local type name to the interface's module-qualified id. */
+interface IfaceBinding {
+  kind: "iface";
+  id: string;
 }
 
 interface RefBinding {
@@ -120,6 +133,10 @@ interface RefBinding {
   refTy: "num" | "bool" | "str" | "list";
   iface?: string;
   seed: ts.Expression;
+  /** Static element capacity for a list pool. Defaults to the target's
+   * poolCap when the seed is not wrapped in withCapacity(); a declared
+   * capacity sizes only THIS pool (and the views derived from it). */
+  cap?: number;
 }
 
 interface ComputedBinding {
@@ -134,15 +151,35 @@ interface ComputedBinding {
 interface FnBinding {
   kind: "fn";
   name: string;
+  /** emitted C function name; in-file helpers are `fn_<name>`, helpers from
+   * imported local modules are `fn_m<idx>_<name>` (collision-free across
+   * modules, since two modules may export the same local name). */
+  cName: string;
   decl: ts.FunctionDeclaration;
   emitted: boolean;
   deps: Set<string>;
-  params: string[]; // s32 params, annotated `: number` in source
+  params: string[]; // annotated `: number` / `: boolean` in source
+  paramTys: ("num" | "bool")[];
+  /** void helpers are side-effecting C functions; num helpers are pure and
+   * compile to an s32 expression at the call site. */
+  result: "void" | "num";
+  /** setup-helper calls appearing in the body (static call graph) */
+  callees: { name: string; node: ts.CallExpression }[];
+  /** first mutating statement in the body: ref/field write, ++/--, push,
+   * splice, or an indirect (element-access) call such as keymap dispatch */
+  writeNode: ts.Node | null;
+  hasValueReturn: boolean;
+  /** For helpers imported from a local const module: that module's captured
+   * scope, reinstalled while the helper is emitted. */
+  moduleScope?: Map<string, Binding>;
 }
 
 interface ConstBinding {
   kind: "const";
   name: string;
+  /** unique C-side key for emitted tables (in-file: the name itself; module
+   * consts: `m<idx>_<name>` so same-named exports never collide). */
+  cName: string;
   value: number | string | string[] | Record<string, number>;
 }
 
@@ -189,7 +226,8 @@ type Binding =
   | ConstBinding
   | LocalBinding
   | KeymapBinding
-  | ComponentBinding;
+  | ComponentBinding
+  | IfaceBinding;
 
 // ---------------------------------------------------------------------------
 // Compiler
@@ -235,6 +273,14 @@ export function compileVaporApp(
 
 class AppCompiler {
   private ifaces = new Map<string, IfaceShape>();
+  /** Component-side type namespace: local type name -> qualified iface id.
+   * Kept separate from the runtime `scope`: interfaces are erased at runtime
+   * but must still resolve by their imported (possibly aliased) local name,
+   * and two imports must not silently share one bare-name shape. */
+  private typeNames = new Map<string, string>();
+  /** Type namespace currently being populated: the component's `typeNames`
+   * at top level, swapped for the module's own map while loading a module. */
+  private activeTypeNames = this.typeNames;
   private scope = new Map<string, Binding>();
   private refs: RefBinding[] = [];
   private computeds: ComputedBinding[] = [];
@@ -248,18 +294,37 @@ class AppCompiler {
   private hostOnButton = "";
   private hostButton = "";
   private hostOnAxisDelta = "";
+  private hostPutChar = "";
+  private hostWithCapacity = "";
 
   // emission
   private decls: string[] = [];
   private bodies: string[] = [];
   private tmpCounter = 0;
   private curDeps: Set<string> | null = null;
+  /** "num" while emitting a `: number` helper body: return must carry a value */
+  private curFnResult: "void" | "num" = "void";
   private strLits = new Map<string, string>(); // literal -> C name
   private strArrays = new Map<string, string>();
+  // vp_sb_at/vp_sb_put are emitted only when the app actually lowers a record
+  // string field read/write through them. gcc/cc65 dead-strip an unused static
+  // inline, but sdcc (GB) keeps it in gen_app.rel and sdld links the object,
+  // so unconditional emission made todo's GB _CODE 184 B heavier (1094 F1).
+  private usedSbAt = false;
+  private usedSbPut = false;
 
   private styleTable = new StyleTable();
   private styleErrors: string[] = [];
   private styleWarnings: string[] = [];
+
+  // ---- local const module loading ------------------------------------------
+  // `import { X } from "./levels.ts"` pulls in a module that may only declare
+  // `export const` literals, closed `export interface`s, and subset helper
+  // `export function`s (number params). No vue/host imports, no refs, no JSX,
+  // no side effects. Modules are compiled into the same translation unit;
+  // each root component is compiled independently (sokoban.tsx and
+  // sokoban.playdate.tsx get separate compilations, no link-time sharing).
+  private moduleStack: string[] = []; // resolved paths being scanned (cycle guard)
 
   /** SCCP result: refs proven constant (name -> value). Reads of these fold
    * through constNum, so they never register dependencies and decidable
@@ -278,7 +343,7 @@ class AppCompiler {
   // computed accessors, keymap actions). The subset forbids recursion and
   // nothing runs from interrupts, so reachability is the whole story.
   // Placeholders are substituted with colored slot names at emit time.
-  private ovlTemps: { id: number; kind: "view" | "sb"; owner: string }[] = [];
+  private ovlTemps: { id: number; kind: "view" | "sb"; owner: string; cap: number }[] = [];
   private ovlEdges = new Map<string, Set<string>>(); // caller -> callees
   private ovlOwnerStack: string[] = [];
   private unitCounter = 0;
@@ -296,9 +361,11 @@ class AppCompiler {
     }
   }
 
-  private allocTemp(kind: "view" | "sb"): string {
+  /** View temps carry the capacity of the list their indices index, so a
+   * small list's temp need not reserve the global VP_VIEW_CAP. */
+  private allocTemp(kind: "view" | "sb", cap = this.target.poolCap): string {
     const id = this.ovlTemps.length;
-    this.ovlTemps.push({ id, kind, owner: this.ovlOwner() });
+    this.ovlTemps.push({ id, kind, owner: this.ovlOwner(), cap });
     return `@OVL${id}@`;
   }
 
@@ -308,6 +375,43 @@ class AppCompiler {
     let set = this.ovlEdges.get(caller);
     if (!set) this.ovlEdges.set(caller, (set = new Set()));
     set.add(callee);
+  }
+
+  /** Targets whose C ABI pads structs to 4-byte alignment: arm-none-eabi-gcc
+   * (GBA), Xtensa gcc (ESP32) and the Playdate builds (arm-eabi-gcc device,
+   * host clang simulator). sdcc (SM83) and cc65 (6502) pack byte-tight. */
+  private get paddedAbi(): boolean {
+    return (
+      this.target.name === "gba" ||
+      this.target.name === "esp32" ||
+      this.target.name === "playdate"
+    );
+  }
+
+  /**
+   * Field order for a generated record typedef. Padding ABIs get a stable
+   * ordering by descending alignment — s32 (4) before vp_sb/u8 (1) — so a
+   * 1-byte field never forces 3 pad bytes before a later s32; fields of the
+   * same alignment keep interface source order. Generated code reaches
+   * fields by name, so the order has no semantic effect. Tight-packing
+   * targets keep source order.
+   */
+  private recordFields(iface: IfaceShape): IfaceShape["fields"] {
+    if (!this.paddedAbi) return iface.fields;
+    const wide = iface.fields.filter((f) => f.ty === "num");
+    const narrow = iface.fields.filter((f) => f.ty !== "num");
+    return [...wide, ...narrow];
+  }
+
+  /** Size of one record slot under the target C ABI. The only align-4 member
+   * is s32 (vp_sb is u8 + char[], align 1): with s32 fields emitted first
+   * the slot needs tail padding only when the record contains one. */
+  private recordStride(iface: IfaceShape): number {
+    const raw = iface.fields.reduce(
+      (a, f) => a + (f.ty === "str" ? this.target.strCap + 1 : f.ty === "bool" ? 1 : 4),
+      0,
+    );
+    return this.paddedAbi && iface.fields.some((f) => f.ty === "num") ? (raw + 3) & ~3 : raw;
   }
 
   /** Color temporaries into shared static slots; returns decls + name map. */
@@ -339,20 +443,42 @@ class AppCompiler {
     let slotBytes = 0;
     for (const kind of ["view", "sb"] as const) {
       const temps = this.ovlTemps.filter((t) => t.kind === kind);
-      const slots: { name: string; members: { owner: string }[] }[] = [];
+      // Assign temps to non-interfering slots; each slot's declaration is as
+      // wide as the largest cap among its members (only relevant for views).
+      const slots: { name: string; members: { owner: string; cap: number }[]; cap: number }[] = [];
       for (const t of temps) {
         let slot = slots.find((s) => s.members.every((m) => !interferes(t, m)));
         if (!slot) {
-          slot = { name: `ovl_${kind}${slots.length}`, members: [] };
+          slot = { name: `ovl_${kind}${slots.length}`, members: [], cap: t.cap };
           slots.push(slot);
-          decls.push(`static ${kind === "view" ? "vp_view" : "vp_sb"} ${slot.name};`);
-          slotBytes += kind === "view" ? 1 + this.target.poolCap : 1 + this.target.strCap;
         }
+        if (t.cap > slot.cap) slot.cap = t.cap;
         slot.members.push(t);
         names.set(t.id, slot.name);
       }
+      for (const slot of slots) {
+        decls.push(`static ${kind === "view" ? this.viewTypeName(slot.cap) : "vp_sb"} ${slot.name};`);
+        slotBytes += kind === "view" ? 1 + slot.cap : 1 + this.target.strCap;
+      }
     }
     return { decls, names, slotBytes };
+  }
+
+  /** C type for a view index array of the given capacity. The target's
+   * default keeps the runtime's `vp_view` typedef (so unannotated apps emit
+   * byte-identical C); a declared capacity gets a local vp_view<cap>. */
+  private viewTypeName(cap: number): string {
+    return cap === this.target.poolCap ? "vp_view" : `vp_view${cap}`;
+  }
+
+  /** Distinct non-default view capacities actually used (overlay temps +
+   * computed views), so the matching local typedefs are emitted once. */
+  private allViewCaps(): number[] {
+    const caps = new Set<number>();
+    for (const t of this.ovlTemps) if (t.kind === "view") caps.add(t.cap);
+    for (const comp of this.computeds) if (comp.valTy.k === "view") caps.add(comp.valTy.cap);
+    caps.delete(this.target.poolCap);
+    return [...caps].sort((a, b) => a - b);
   }
 
   constructor(
@@ -373,7 +499,7 @@ class AppCompiler {
   }
 
   private err(node: ts.Node, message: string): never {
-    throw new VaporCompileError(this.sf, node, message);
+    throw new VaporCompileError(node.getSourceFile(), node, message);
   }
 
   // ---- module scan ---------------------------------------------------------
@@ -381,8 +507,8 @@ class AppCompiler {
   compile(): CompiledApp {
     let component: ts.ArrowFunction | null = null;
     for (const stmt of this.sf.statements) {
-      if (ts.isImportDeclaration(stmt)) this.scanImport(stmt);
-      else if (ts.isInterfaceDeclaration(stmt)) this.scanInterface(stmt);
+      if (ts.isImportDeclaration(stmt)) this.scanImport(stmt, this.sf, dirname(this.sf.fileName));
+      else if (ts.isInterfaceDeclaration(stmt)) this.scanInterface(stmt, null, this.typeNames);
       else if (ts.isTypeAliasDeclaration(stmt)) continue; // types are erased
       else if (ts.isFunctionDeclaration(stmt)) this.scanComponent(stmt);
       else if (ts.isVariableStatement(stmt)) this.scanModuleConst(stmt);
@@ -402,54 +528,514 @@ class AppCompiler {
       foldConst: (e) => this.constNum(e) ?? this.constBool(e),
     });
     this.scanSetup(component);
+    // The subset forbids recursion (generated C is stack-fixed and uses
+    // forward-only emission). Check one static call graph over in-file setup
+    // helpers and every imported module helper before emitting any C.
+    this.rejectRecursiveHelpers();
     return this.emit();
   }
 
-  private scanImport(stmt: ts.ImportDeclaration): void {
+  private scanImport(stmt: ts.ImportDeclaration, sf: ts.SourceFile, baseDir: string, inModule = false): void {
     const from = (stmt.moduleSpecifier as ts.StringLiteral).text;
     const bindings = stmt.importClause?.namedBindings;
     if (!bindings || !ts.isNamedImports(bindings)) this.err(stmt, "only named imports are supported");
-    for (const spec of bindings.elements) {
-      const imported = (spec.propertyName ?? spec.name).text;
-      const local = spec.name.text;
-      if (from === "vue") {
+    if (from === "vue") {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "vue" — they can only declare const data, interfaces, and pure-subset helpers`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        const local = spec.name.text;
         if (imported === "ref") this.vueRef = local;
         else if (imported === "computed") this.vueComputed = local;
         else this.err(spec, `unsupported vue import: ${imported} (subset allows ref, computed)`);
-      } else if (/\/host\/input(\.ts)?$/.test(from)) {
-        if (imported === "onButton") this.hostOnButton = local;
-        else if (imported === "Button") this.hostButton = local;
-        else if (imported === "onAxisDelta") this.hostOnAxisDelta = local;
-        else if (imported === "RelativeAxis")
+      }
+      return;
+    }
+    if (/\/host\/input(\.ts)?$/.test(from) || /\/host\/screen(\.ts)?$/.test(from)) {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "${from}" — host APIs belong to the component, not the data module`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        const local = spec.name.text;
+        if (/\/host\/input(\.ts)?$/.test(from)) {
+          if (imported === "onButton") this.hostOnButton = local;
+          else if (imported === "Button") this.hostButton = local;
+          else if (imported === "onAxisDelta") this.hostOnAxisDelta = local;
+          else if (imported === "RelativeAxis")
+            this.scope.set(local, { kind: "const", cName: local, name: local, value: { Primary: 0, Secondary: 1 } });
+          else if (imported === "RelativeAxisUnits")
+            this.scope.set(local, {
+              kind: "const",
+              cName: local,
+              name: local,
+              value: { PerDegree: 1000, PerTurn: 360000 },
+            });
+          else this.err(spec, `unsupported host import: ${imported}`);
+        } else {
+          if (imported !== "SCREEN") this.err(spec, `unsupported host import: ${imported}`);
           this.scope.set(local, {
             kind: "const",
+            cName: local,
             name: local,
-            value: { Primary: 0, Secondary: 1 },
+            value: { width: this.target.width, height: this.target.height },
           });
-        else if (imported === "RelativeAxisUnits")
-          this.scope.set(local, {
-            kind: "const",
-            name: local,
-            value: { PerDegree: 1000, PerTurn: 360000 },
-          });
+        }
+      }
+      return;
+    }
+    if (/\/host\/text(\.ts)?$/.test(from)) {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "${from}" — host APIs belong to the component, not the data module`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        if (imported === "putChar") this.hostPutChar = spec.name.text;
         else this.err(spec, `unsupported host import: ${imported}`);
-      } else if (/\/host\/screen(\.ts)?$/.test(from)) {
-        if (imported !== "SCREEN") this.err(spec, `unsupported host import: ${imported}`);
-        this.scope.set(local, {
-          kind: "const",
-          name: local,
-          value: { width: this.target.width, height: this.target.height },
-        });
-      } else this.err(stmt, `unsupported import source: ${from}`);
+      }
+      return;
+    }
+    if (/\/host\/list(\.ts)?$/.test(from)) {
+      if (inModule)
+        this.err(
+          stmt.moduleSpecifier,
+          `imported const modules may not import "${from}" — host APIs belong to the component, not the data module`,
+        );
+      for (const spec of bindings.elements) {
+        const imported = (spec.propertyName ?? spec.name).text;
+        if (imported === "withCapacity") this.hostWithCapacity = spec.name.text;
+        else this.err(spec, `unsupported host import: ${imported}`);
+      }
+      return;
+    }
+    if (!from.startsWith("./") && !from.startsWith("../"))
+      this.err(
+        stmt.moduleSpecifier,
+        `unsupported import source: ${from} (local imports must use a relative path like "./levels.ts")`,
+      );
+    // Local const module: load (recursively) and bind the requested exports.
+    const mod = this.loadModule(from, stmt, baseDir);
+    for (const spec of bindings.elements) {
+      const imported = (spec.propertyName ?? spec.name).text;
+      const local = spec.name.text;
+      const binding = mod.exports.get(imported);
+      if (!binding) this.err(spec, `module "${from}" does not export ${imported}`);
+      if (binding.kind === "iface") {
+        // Erased at runtime, but the local (possibly aliased) type name must
+        // resolve in *this* file's type namespace to the interface's own
+        // qualified id, so same-named exports never share a shape.
+        if (this.activeTypeNames.has(local))
+          this.err(
+            spec,
+            `duplicate interface name ${local}: already declared or imported in this module`,
+          );
+        this.activeTypeNames.set(local, binding.id);
+        continue;
+      }
+      this.scope.set(local, binding);
     }
   }
 
-  private scanInterface(decl: ts.InterfaceDeclaration): void {
+  private moduleCount = 0;
+
+  private resolveModulePath(from: string, node: ts.Node, baseDir: string): string {
+    let path = resolve(baseDir, from);
+    if (!existsSync(path)) {
+      if (existsSync(path + ".ts")) path += ".ts";
+      else this.err(node, `cannot find local module "${from}"`);
+    }
+    if (!/\.(ts|tsx)$/.test(path))
+      this.err(node, `local module "${from}" must be a .ts file`);
+    return path;
+  }
+
+  /** Loaded module record. `scope` is the module's own binding environment,
+   * captured at scan time; when one of its helpers is emitted/validated it is
+   * layered on top of the component scope, so a module helper has the same
+   * powers as an in-file helper (reads/writes of component refs) while its
+   * own consts and sibling helpers take precedence. `typeNames` is the
+   * module's local type namespace: a type name it declares or imports,
+   * mapped to the interface's module-qualified id. */
+  private moduleRecords = new Map<
+    string,
+    {
+      exports: Map<string, Binding>;
+      typeNames: Map<string, string>;
+      scope: Map<string, Binding>;
+      helpers: FnBinding[];
+    }
+  >();
+
+  private loadModule(
+    from: string,
+    importNode: ts.ImportDeclaration,
+    baseDir: string,
+  ): {
+    exports: Map<string, Binding>;
+    typeNames: Map<string, string>;
+    scope: Map<string, Binding>;
+    helpers: FnBinding[];
+  } {
+    const path = this.resolveModulePath(from, importNode.moduleSpecifier, baseDir);
+    const cached = this.moduleRecords.get(path);
+    if (cached) return cached;
+    if (this.moduleStack.includes(path))
+      this.err(
+        importNode.moduleSpecifier,
+        `circular import detected: ${[...this.moduleStack.slice(this.moduleStack.indexOf(path)), path]
+          .map((pp) => pp.replace(/^.*\//, ""))
+          .join(" -> ")}`,
+      );
+    let text: string;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch {
+      this.err(importNode.moduleSpecifier, `cannot read local module "${from}"`);
+    }
+    const modSf = ts.createSourceFile(path, text, ts.ScriptTarget.ESNext, true, ts.ScriptKind.TS);
+    const idx = this.moduleCount++;
+    this.moduleStack.push(path);
+    const savedScope = this.scope;
+    const savedTypes = this.activeTypeNames;
+    const modScope = new Map<string, Binding>();
+    const modTypes = new Map<string, string>();
+    this.scope = modScope;
+    this.activeTypeNames = modTypes;
+    const exports = new Map<string, Binding>();
+    const helpers: FnBinding[] = [];
+    try {
+      for (const stmt of modSf.statements) {
+        if (ts.isImportDeclaration(stmt)) {
+          // Modules may only pull in other local const modules — never vue/host.
+          this.scanImport(stmt, modSf, dirname(path), true);
+          continue;
+        }
+        const isExported =
+          ts.canHaveModifiers(stmt) &&
+          !!ts.getModifiers(stmt)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+        if (ts.isInterfaceDeclaration(stmt)) {
+          if (!isExported)
+            this.err(stmt, "imported modules may only contain `export interface` declarations");
+          const shape = this.scanInterface(stmt, idx, modTypes);
+          exports.set(stmt.name.text, { kind: "iface", id: shape.id });
+          continue;
+        }
+        if (ts.isFunctionDeclaration(stmt)) {
+          if (!isExported || !stmt.name)
+            this.err(
+              stmt,
+              "imported modules may only export subset helpers (`export function name(d: number)`) — no inner functions",
+            );
+          const binding = this.scanModuleFunction(stmt, modSf, idx);
+          helpers.push(binding);
+          exports.set(stmt.name.text, binding);
+          continue;
+        }
+        if (ts.isVariableStatement(stmt)) {
+          if (!isExported)
+            this.err(
+              stmt,
+              "imported modules may only export `export const` data (number, string, string[], {name: number})",
+            );
+          for (const name of this.scanModuleConst(stmt, modSf, idx))
+            exports.set(name, modScope.get(name)!);
+          continue;
+        }
+        this.err(
+          stmt,
+          `imported modules may only contain export const, export interface, and export function declarations — got ${ts.SyntaxKind[stmt.kind]}`,
+        );
+      }
+    } finally {
+      this.scope = savedScope;
+      this.activeTypeNames = savedTypes;
+      this.moduleStack.pop();
+    }
+    const record = { exports, typeNames: modTypes, scope: modScope, helpers };
+    this.moduleRecords.set(path, record);
+    // Bodies validate after every declaration is in the module scope so
+    // helpers may call each other in any order (function hoisting semantics).
+    for (const binding of helpers) this.validateModuleHelper(binding);
+    return record;
+  }
+
+  private scanModuleFunction(decl: ts.FunctionDeclaration, sf: ts.SourceFile, modIdx: number): FnBinding {
+    const params = decl.parameters.map((p) => {
+      if (!ts.isIdentifier(p.name)) this.err(p, "helper params must be simple names");
+      if (!p.type || p.type.getText(sf) !== "number")
+        this.err(p, "helper params must be annotated `: number`");
+      return p.name.text;
+    });
+    if (!decl.body || !ts.isBlock(decl.body)) this.err(decl, "helpers need a block body");
+    if (decl.typeParameters) this.err(decl, "helpers may not be generic");
+    if (decl.type && decl.type.getText(sf) !== "void")
+      this.err(decl.type, "imported module helpers cannot return values yet (void subset; pure number-returning helpers are a separate extension)");
+    const binding: FnBinding = {
+      kind: "fn",
+      name: decl.name!.text,
+      cName: `fn_m${modIdx}_${decl.name!.text}`,
+      decl,
+      emitted: false,
+      deps: new Set(),
+      params,
+      paramTys: params.map(() => "num" as const),
+      result: "void",
+      callees: [],
+      writeNode: null,
+      hasValueReturn: false,
+      moduleScope: this.scope,
+    };
+    if (this.scope.has(decl.name!.text)) this.err(decl, `duplicate declaration of ${decl.name!.text} in module`);
+    this.scope.set(decl.name!.text, binding);
+    return binding;
+  }
+
+  /** Validate an imported-module helper by compiling its body through the
+   * real statement/expression pipeline with emission state snapshotted and
+   * rolled back: the dry run proves the body is in the void-helper subset
+   * (file:line:col diagnostics from the module's own source file) without
+   * emitting any C or interned strings. Keymaps/JSX/refs are impossible in a
+   * module scope and the normal compile paths reject them. */
+  private validateModuleHelper(b: FnBinding): void {
+    const modScope = b.moduleScope!;
+    const savedScope = this.scope;
+    const savedCurDeps = this.curDeps;
+    const savedHoist = this.hoist;
+    const savedBodiesLen = this.bodies.length;
+    const savedDeclsLen = this.decls.length;
+    const savedStrLits = new Map(this.strLits);
+    const savedStrArrays = new Map(this.strArrays);
+    const savedTmpCounter = this.tmpCounter;
+    const savedOvlTempsLen = this.ovlTemps.length;
+    const savedOvlEdges = new Map([...this.ovlEdges].map(([k, v]) => [k, new Set(v)]));
+    const flipped: FnBinding[] = [];
+    const markEmitted = (): void => {
+      for (const rec of this.moduleRecords.values())
+        for (const binding of rec.scope.values())
+          if (binding.kind === "fn" && binding.emitted) flipped.push(binding);
+    };
+    markEmitted();
+    const wasEmitted = new Set(flipped);
+    this.curDeps = b.deps;
+    this.scope = new Map(modScope);
+    try {
+      for (const p of b.params) this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: NUM });
+      this.withOwner(b.cName, () =>
+        this.withHoist((out) => {
+          for (const stmt of b.decl.body!.statements) this.compileStmt(stmt, out, "  ");
+        }),
+      );
+    } finally {
+      this.bodies.length = savedBodiesLen;
+      this.decls.length = savedDeclsLen;
+      this.strLits = savedStrLits;
+      this.strArrays = savedStrArrays;
+      this.tmpCounter = savedTmpCounter;
+      this.ovlTemps.length = savedOvlTempsLen;
+      this.ovlEdges = savedOvlEdges;
+      for (const rec of this.moduleRecords.values())
+        for (const binding of rec.scope.values())
+          if (binding.kind === "fn" && binding.emitted && !wasEmitted.has(binding)) binding.emitted = false;
+      this.scope = savedScope;
+      this.curDeps = savedCurDeps;
+      this.hoist = savedHoist;
+    }
+  }
+
+  /** Reject any recursion among setup helpers and imported module helpers.
+   * The subset emits forward-only, stack-fixed C with no recursion, so the
+   * check runs once over a single static call graph before C emission. A
+   * call is resolved the same way the emitter resolves it — the helper's
+   * own module scope (or the component scope for in-file helpers) — with
+   * params and block-local `const`/`let` names shadowing helpers. */
+  private rejectRecursiveHelpers(): void {
+    const all: FnBinding[] = [...this.fns];
+    for (const rec of this.moduleRecords.values()) all.push(...rec.helpers);
+
+    // Per-helper lexical base environment (name -> fn binding). A module
+    // helper resolves calls in its own module scope; an in-file setup helper
+    // resolves them in the component scope (sibling helpers + imports).
+    const fnEnv = (fn: FnBinding): Map<string, Binding> => fn.moduleScope ?? this.scope;
+    const baseFns = new Map<FnBinding, Map<string, FnBinding>>();
+    for (const fn of all) {
+      const fns = new Map<string, FnBinding>();
+      for (const [name, b] of fnEnv(fn)) if (b.kind === "fn") fns.set(name, b);
+      baseFns.set(fn, fns);
+    }
+
+    // Static call edges with one representative call site per edge (the
+    // first encountered), used for the file:line:col diagnostic.
+    const edges = new Map<FnBinding, Set<FnBinding>>();
+    const edgeSite = new Map<string, ts.CallExpression>();
+    const record = (caller: FnBinding, callee: FnBinding, node: ts.CallExpression): void => {
+      let set = edges.get(caller);
+      if (!set) edges.set(caller, (set = new Set()));
+      set.add(callee);
+      const key = `${caller.cName}->${callee.cName}`;
+      if (!edgeSite.has(key)) edgeSite.set(key, node);
+    };
+
+    for (const fn of all) {
+      const fns = baseFns.get(fn)!;
+      const shadows = new Set(fn.params);
+      for (const stmt of fn.decl.body!.statements)
+        this.walkStmtCalls(stmt, shadows, fns, (callee, node) => record(fn, callee, node));
+    }
+
+    // DFS with tri-color marking; a gray neighbor is a back edge (cycle).
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map<FnBinding, number>(all.map((fn) => [fn, WHITE]));
+    const stack: FnBinding[] = [];
+    const visit = (fn: FnBinding): void => {
+      color.set(fn, GRAY);
+      stack.push(fn);
+      for (const callee of edges.get(fn) ?? []) {
+        if (color.get(callee) === GRAY) {
+          const cycle = [...stack.slice(stack.indexOf(callee)), callee].map((h) => h.name).join(" -> ");
+          const site = edgeSite.get(`${fn.cName}->${callee.cName}`)!;
+          this.err(
+            site,
+            `recursive helper call is not supported in the vapor subset (${cycle}); generated C is non-recursive — restructure with a loop`,
+          );
+        }
+        if (color.get(callee) === WHITE) visit(callee);
+      }
+      stack.pop();
+      color.set(fn, BLACK);
+    };
+    for (const fn of all) if (color.get(fn) === WHITE) visit(fn);
+  }
+
+  /** Walk a helper-body statement in execution order, mirroring compileStmt's
+   * scoping: block locals shadow outer names only from their declaration on. */
+  private walkStmtCalls(
+    stmt: ts.Statement,
+    shadows: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    if (ts.isReturnStatement(stmt)) {
+      if (stmt.expression) this.walkExprCalls(stmt.expression, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isIfStatement(stmt)) {
+      this.walkExprCalls(stmt.expression, shadows, fns, onCall);
+      this.walkStmtCalls(stmt.thenStatement, shadows, fns, onCall);
+      if (stmt.elseStatement) this.walkStmtCalls(stmt.elseStatement, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isBlock(stmt)) {
+      this.walkStmtList(stmt.statements, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isVariableStatement(stmt)) {
+      this.walkVarList(stmt.declarationList.declarations, shadows, fns, onCall);
+      return;
+    }
+    if (ts.isForStatement(stmt)) {
+      const inner = new Set(shadows);
+      if (stmt.initializer && ts.isVariableDeclarationList(stmt.initializer))
+        this.walkVarList(stmt.initializer.declarations, inner, fns, onCall);
+      if (stmt.condition) this.walkExprCalls(stmt.condition, inner, fns, onCall);
+      if (stmt.incrementor) this.walkExprCalls(stmt.incrementor, inner, fns, onCall);
+      this.walkStmtCalls(stmt.statement, inner, fns, onCall);
+      return;
+    }
+    if (ts.isExpressionStatement(stmt)) {
+      this.walkExprCalls(stmt.expression, shadows, fns, onCall);
+      return;
+    }
+    // Any statement form outside the void-helper subset is rejected later by
+    // the real pipeline; descend generically so a nested call is still seen.
+    ts.forEachChild(stmt, (child) => {
+      if (child && ts.isStatement(child)) this.walkStmtCalls(child, shadows, fns, onCall);
+      else if (child) this.walkExprCalls(child as ts.Expression, shadows, fns, onCall);
+    });
+  }
+
+  private walkStmtList(
+    stmts: ts.NodeArray<ts.Statement>,
+    outer: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    const inner = new Set(outer);
+    for (const stmt of stmts) {
+      if (ts.isVariableStatement(stmt)) this.walkVarList(stmt.declarationList.declarations, inner, fns, onCall);
+      else this.walkStmtCalls(stmt, inner, fns, onCall);
+    }
+  }
+
+  private walkVarList(
+    decls: ts.NodeArray<ts.VariableDeclaration>,
+    shadows: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    for (const decl of decls) {
+      if (decl.initializer) this.walkExprCalls(decl.initializer, shadows, fns, onCall);
+      // The local binds only after its initializer.
+      if (ts.isIdentifier(decl.name)) shadows.add(decl.name.text);
+    }
+  }
+
+  private walkExprCalls(
+    node: ts.Node,
+    shadows: Set<string>,
+    fns: Map<string, FnBinding>,
+    onCall: (callee: FnBinding, node: ts.CallExpression) => void,
+  ): void {
+    if (ts.isCallExpression(node)) {
+      // Unparen the callee before classifying: `(loop)(n - 1)` is the same
+      // call as `loop(n - 1)` and must land in the same static recursion
+      // edges (review task 1155 R1; the code generator unparens too).
+      const calleeExpr = this.unparen(node.expression);
+      if (ts.isIdentifier(calleeExpr)) {
+        const callee = shadows.has(calleeExpr.text) ? undefined : fns.get(calleeExpr.text);
+        if (callee) onCall(callee, node);
+      }
+    }
+    // Arrow params introduce a new lexical scope (defensive: helper args are
+    // numbers, but a callback's params must not resolve as helper names).
+    if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
+      const inner = new Set(shadows);
+      for (const p of node.parameters) if (ts.isIdentifier(p.name)) inner.add(p.name.text);
+      if (ts.isBlock(node.body)) this.walkStmtList(node.body.statements, inner, fns, onCall);
+      else this.walkExprCalls(node.body, inner, fns, onCall);
+      return;
+    }
+    ts.forEachChild(node, (child) => {
+      if (child) this.walkExprCalls(child, shadows, fns, onCall);
+    });
+  }
+
+  private scanInterface(
+    decl: ts.InterfaceDeclaration,
+    modIdx: number | null,
+    localTypeNames: Map<string, string>,
+  ): IfaceShape {
+    // Heritage is not in the closed-record subset: reject it with a located
+    // diagnostic at the `extends` keyword rather than crashing later.
+    for (const clause of decl.heritageClauses ?? []) {
+      if (clause.token === ts.SyntaxKind.ExtendsKeyword)
+        this.err(
+          clause,
+          `interface inheritance ("extends") is not supported in the vapor subset — flatten ${decl.name.text}'s inherited fields into one closed interface`,
+        );
+      this.err(clause, `unsupported interface heritage clause (${ts.SyntaxKind[clause.token]})`);
+    }
     const fields: IfaceShape["fields"] = [];
     for (const member of decl.members) {
       if (!ts.isPropertySignature(member) || !member.type || !ts.isIdentifier(member.name))
         this.err(member, "interface members must be `name: type`");
-      const tyText = member.type.getText(this.sf);
+      const tyText = member.type.getText();
       if (tyText !== "string" && tyText !== "boolean" && tyText !== "number")
         this.err(member.type, `interface field type must be string | boolean | number, got ${tyText}`);
       fields.push({
@@ -457,36 +1043,65 @@ class AppCompiler {
         ty: tyText === "string" ? "str" : tyText === "boolean" ? "bool" : "num",
       });
     }
-    this.ifaces.set(decl.name.text, { name: decl.name.text, fields });
+    const bare = decl.name.text;
+    if (localTypeNames.has(bare)) this.err(decl.name, `duplicate interface ${bare}`);
+    // Qualified identity keeps same-named interfaces in different modules
+    // from sharing a record shape. In-file interfaces keep the bare name so
+    // existing single-file apps are byte-identical.
+    const id = modIdx === null ? bare.toLowerCase() : `m${modIdx}_${bare.toLowerCase()}`;
+    const shape: IfaceShape = { name: bare, id, fields };
+    this.ifaces.set(id, shape);
+    localTypeNames.set(bare, id);
+    return shape;
   }
 
-  private scanModuleConst(stmt: ts.VariableStatement): void {
-    if (!(stmt.declarationList.flags & ts.NodeFlags.Const)) this.err(stmt, "module variables must be const");
+  private scanModuleConst(
+    stmt: ts.VariableStatement,
+    sf: ts.SourceFile = this.sf,
+    modIdx = -1,
+  ): string[] {
+    if (!(stmt.declarationList.flags & ts.NodeFlags.Const))
+      throw new VaporCompileError(sf, stmt, "module variables must be const");
+    const names: string[] = [];
     for (const decl of stmt.declarationList.declarations) {
-      if (!ts.isIdentifier(decl.name) || !decl.initializer) this.err(decl, "const needs a simple name + initializer");
+      if (!ts.isIdentifier(decl.name) || !decl.initializer)
+        throw new VaporCompileError(sf, decl, "const needs a simple name + initializer");
       const name = decl.name.text;
+      const cName = modIdx >= 0 ? `m${modIdx}_${name}` : name;
       const init = decl.initializer;
+      const put = (value: ConstBinding["value"]): void => {
+        this.scope.set(name, { kind: "const", name: cName, cName, value });
+        names.push(name);
+      };
       const folded = this.constNum(init) ?? this.constBool(init);
-      if (folded !== null) this.scope.set(name, { kind: "const", name, value: folded });
-      else if (ts.isStringLiteral(init)) this.scope.set(name, { kind: "const", name, value: init.text });
+      if (folded !== null) put(folded);
+      else if (ts.isStringLiteral(init)) put(init.text);
       else if (ts.isArrayLiteralExpression(init)) {
         const items = init.elements.map((el) => {
-          if (!ts.isStringLiteral(el)) this.err(el, "const arrays must contain string literals");
+          if (!ts.isStringLiteral(el))
+            throw new VaporCompileError(sf, el, "const arrays must contain string literals");
           return el.text;
         });
-        this.scope.set(name, { kind: "const", name, value: items });
+        put(items);
       } else if (ts.isObjectLiteralExpression(init)) {
         const record: Record<string, number> = {};
         for (const prop of init.properties) {
           if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name))
-            this.err(prop, "const objects must use `name: number` members");
+            throw new VaporCompileError(sf, prop, "const objects must use `name: number` members");
           const v = this.constNum(prop.initializer);
-          if (v === null) this.err(prop.initializer, "const object members must be compile-time numbers");
+          if (v === null)
+            throw new VaporCompileError(sf, prop.initializer, "const object members must be compile-time numbers");
           record[prop.name.text] = v;
         }
-        this.scope.set(name, { kind: "const", name, value: record });
-      } else this.err(init, "module consts must be number, string, string[], or {name: number} literals");
+        put(record);
+      } else
+        throw new VaporCompileError(
+          sf,
+          init,
+          "module consts must be number, string, string[], or {name: number} literals",
+        );
     }
+    return names;
   }
 
   // ---- setup scan ----------------------------------------------------------
@@ -497,19 +1112,91 @@ class AppCompiler {
       if (ts.isVariableStatement(stmt)) this.scanSetupConst(stmt);
       else if (ts.isFunctionDeclaration(stmt)) {
         if (!stmt.name || !stmt.body) this.err(stmt, "setup functions need a name and body");
-        const params = stmt.parameters.map((p) => {
+        const params: string[] = [];
+        const paramTys: ("num" | "bool")[] = [];
+        for (const p of stmt.parameters) {
           if (!ts.isIdentifier(p.name)) this.err(p, "helper params must be simple names");
-          if (!p.type || p.type.getText(this.sf) !== "number")
-            this.err(p, "helper params must be annotated `: number`");
-          return p.name.text;
-        });
+          const tyText = p.type?.getText(this.sf);
+          if (tyText !== "number" && tyText !== "boolean")
+            this.err(p, "helper params must be annotated `: number` or `: boolean`");
+          params.push(p.name.text);
+          paramTys.push(tyText === "boolean" ? "bool" : "num");
+        }
+        // an explicit `: number` makes the helper a pure s32-returning
+        // function; no annotation (or explicit `: void`) keeps the void
+        // statement helper.
+        let result: FnBinding["result"] = "void";
+        const retTyText = stmt.type?.getText(this.sf);
+        if (retTyText !== undefined && retTyText !== "void") {
+          if (retTyText !== "number") this.err(stmt.type!, "helper return type must be `: number` (or omitted)");
+          result = "num";
+        }
+        const callees: FnBinding["callees"] = [];
+        let writeNode: ts.Node | null = null;
+        let hasValueReturn = false;
+        /** The subset's only assignment targets are `x.value` and record
+         * fields (compileAssign rejects bare locals). So a property-access
+         * LHS is exactly the reactive-write set. */
+        const unwrapParen = (e: ts.Expression): ts.Expression => {
+          while (ts.isParenthesizedExpression(e)) e = e.expression;
+          return e;
+        };
+        const noteWrite = (n: ts.Node): void => {
+          writeNode ??= n;
+        };
+        const walk = (node: ts.Node): void => {
+          if (ts.isCallExpression(node)) {
+            // The code generators (compileCall / compileExprStmt) unparen the
+            // callee, so the static checks must classify the same expression:
+            // `(bump)()`, `(KM[i])?.()` and `(items.value.push)(...)` are the
+            // same calls as without the parens (review task 1155 R1).
+            const callee = unwrapParen(node.expression);
+            if (ts.isIdentifier(callee)) {
+              callees.push({ name: callee.text, node });
+            } else if (
+              ts.isPropertyAccessExpression(callee) &&
+              (callee.name.text === "push" || callee.name.text === "splice")
+            ) {
+              noteWrite(node);
+            } else if (ts.isElementAccessExpression(callee)) {
+              // indirect dispatch such as a keymap table `KM[i]?.()`: the
+              // static graph cannot name the callee, which may be a void
+              // action that writes refs. Count it as a possible write so the
+              // purity gate cannot be bypassed through a dispatch table.
+              noteWrite(node);
+            }
+          }
+          if (ts.isReturnStatement(node) && node.expression) hasValueReturn = true;
+          if (ts.isBinaryExpression(node)) {
+            const op = node.operatorToken.kind;
+            if (op >= ts.SyntaxKind.FirstAssignment && op <= ts.SyntaxKind.LastAssignment) {
+              if (ts.isPropertyAccessExpression(unwrapParen(node.left))) noteWrite(node);
+            }
+          }
+          if (
+            (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+            (node.operator === ts.SyntaxKind.PlusPlusToken ||
+              node.operator === ts.SyntaxKind.MinusMinusToken) &&
+            ts.isPropertyAccessExpression(unwrapParen(node.operand))
+          ) {
+            noteWrite(node);
+          }
+          ts.forEachChild(node, walk);
+        };
+        walk(stmt.body);
         const binding: FnBinding = {
           kind: "fn",
           name: stmt.name.text,
+          cName: `fn_${stmt.name.text}`,
           decl: stmt,
           emitted: false,
           deps: new Set(),
           params,
+          paramTys,
+          result,
+          callees,
+          writeNode,
+          hasValueReturn,
         };
         this.scope.set(stmt.name.text, binding);
         this.fns.push(binding);
@@ -551,6 +1238,71 @@ class AppCompiler {
       } else this.err(stmt, `unsupported setup statement: ${ts.SyntaxKind[stmt.kind]}`);
     }
     if (!this.template) this.err(component, "component never returned JSX");
+    this.analyzeHelpers();
+  }
+
+  /** Static checks over the setup-helper call graph: no recursion (the
+   * overlay allocator and the no-C-stack design both assume acyclic calls),
+   * and a `: number` helper must be pure — no writes of its own, and every
+   * helper it calls returns a number too. Since cycles are rejected, the
+   * per-node checks imply transitive purity. */
+  private analyzeHelpers(): void {
+    const byName = new Map(this.fns.map((b) => [b.name, b]));
+    const WHITE = 0;
+    const GRAY = 1;
+    const BLACK = 2;
+    const color = new Map<string, number>();
+    const dfs = (b: FnBinding): void => {
+      color.set(b.name, GRAY);
+      for (const edge of b.callees) {
+        const callee = byName.get(edge.name);
+        if (!callee) continue; // unknown callees are diagnosed in compileCall
+        const c = color.get(callee.name) ?? WHITE;
+        if (c === GRAY)
+          this.err(edge.node, `recursive helper call through '${callee.name}': recursion is not supported`);
+        if (c === WHITE) dfs(callee);
+      }
+      color.set(b.name, BLACK);
+    };
+    for (const b of this.fns) if ((color.get(b.name) ?? WHITE) === WHITE) dfs(b);
+
+    for (const b of this.fns) {
+      if (b.result !== "num") continue;
+      if (!b.hasValueReturn)
+        this.err(b.decl, `helper '${b.name}' declares \`: number\` but never returns a value`);
+      if (!this.allPathsReturn(b.decl.body!))
+        this.err(
+          b.decl,
+          `helper '${b.name}' declares \`: number\` but can reach the end without returning a value`,
+        );
+      if (b.writeNode)
+        this.err(
+          b.writeNode,
+          "helpers that return a number must be pure (no .value or field writes, no push/splice, no indirect calls such as keymap dispatch)",
+        );
+      for (const edge of b.callees) {
+        const callee = byName.get(edge.name);
+        if (callee && callee.result !== "num")
+          this.err(
+            edge.node,
+            `number helper '${b.name}' can only call other number helpers; '${callee.name}' is a void helper`,
+          );
+      }
+    }
+  }
+
+  /** Conservative "returns on every path": a trailing return, or an
+   * if/else whose arms both return. Loops don't count (they may run zero
+   * times). Keeps the emitted s32 function from falling off its end. */
+  private allPathsReturn(stmt: ts.Statement): boolean {
+    if (ts.isBlock(stmt)) {
+      const last = stmt.statements[stmt.statements.length - 1];
+      return !!last && this.allPathsReturn(last);
+    }
+    if (ts.isReturnStatement(stmt)) return true;
+    if (ts.isIfStatement(stmt))
+      return !!stmt.elseStatement && this.allPathsReturn(stmt.thenStatement) && this.allPathsReturn(stmt.elseStatement);
+    return false;
   }
 
   private scanSetupConst(stmt: ts.VariableStatement): void {
@@ -559,16 +1311,45 @@ class AppCompiler {
       const name = decl.name.text;
       const init = decl.initializer;
       if (ts.isCallExpression(init) && ts.isIdentifier(init.expression) && init.expression.text === this.vueRef) {
-        const seed = init.arguments[0];
+        let seed = init.arguments[0];
+        let declaredCap: number | undefined;
         if (!seed) this.err(init, "ref() needs an initial value");
+        // withCapacity(seedArray, n): amphibious static pool-cap annotation
+        // (host/list.ts). The wrapper is erased; only the inner array seeds
+        // the list and n sizes its backing C array.
+        const capCall = this.unparen(seed);
+        if (
+          ts.isCallExpression(capCall) &&
+          ts.isIdentifier(capCall.expression) &&
+          capCall.expression.text === this.hostWithCapacity &&
+          this.hostWithCapacity
+        ) {
+          if (capCall.arguments.length !== 2)
+            this.err(capCall, "withCapacity takes exactly (seedArray, capacity)");
+          seed = capCall.arguments[0];
+          const capNode = capCall.arguments[1];
+          const capVal = this.constNum(capNode);
+          if (capVal === null || !Number.isInteger(capVal) || capVal < 1)
+            this.err(capNode, "withCapacity capacity must be a positive compile-time integer");
+          if (capVal > 255) this.err(capNode, "withCapacity capacity must fit in u8 (max 255)");
+          declaredCap = capVal;
+          if (!ts.isArrayLiteralExpression(this.unparen(seed)))
+            this.err(capCall, "withCapacity only annotates list refs ref<T[]>([...])");
+        }
         const binding: RefBinding = {
           kind: "ref",
           name,
           index: this.refs.length,
           refTy: this.classifyRefSeed(init, seed),
           seed,
+          cap: declaredCap,
         };
-        if (binding.refTy === "list") binding.iface = this.listIfaceOf(init, seed);
+        if (binding.refTy === "list") {
+          binding.iface = this.listIfaceOf(init, seed);
+          const seedLen = (seed as ts.ArrayLiteralExpression).elements.length;
+          if (declaredCap !== undefined && declaredCap < seedLen)
+            this.err(capCall, `withCapacity capacity ${declaredCap} is smaller than the ${seedLen}-element seed`);
+        }
         if (this.refs.length >= 16) this.err(init, "subset budget: at most 16 refs");
         this.refs.push(binding);
         this.scope.set(name, binding);
@@ -604,8 +1385,13 @@ class AppCompiler {
   private listIfaceOf(call: ts.CallExpression, seed: ts.Expression): string {
     const typeArg = call.typeArguments?.[0];
     if (typeArg && ts.isArrayTypeNode(typeArg) && ts.isTypeReferenceNode(typeArg.elementType)) {
-      const name = typeArg.elementType.typeName.getText(this.sf);
-      if (this.ifaces.has(name)) return name;
+      const refNode = typeArg.elementType.typeName;
+      if (ts.isIdentifier(refNode)) {
+        // Resolve through the component's type namespace so imported and
+        // aliased interfaces map to their module-qualified id.
+        const id = this.typeNames.get(refNode.text);
+        if (id !== undefined && this.ifaces.has(id)) return id;
+      }
     }
     this.err(seed, "list refs need an explicit ref<T[]>(...) annotation with a declared interface T");
   }
@@ -729,8 +1515,10 @@ class AppCompiler {
         const b = this.scope.get(value.text);
         if (b?.kind !== "fn") this.err(value, "keymap values must be arrows or setup functions");
         if (b.params.length !== 0) this.err(value, `${b.name} takes arguments; wrap it in an arrow`);
+        if (b.result === "num")
+          this.err(value, `keymap action '${b.name}' cannot return a value; use a void helper`);
         this.emitFn(b);
-        entries.set(key, `fn_${b.name}`);
+        entries.set(key, b.cName);
       } else this.err(pa.initializer, "keymap values must be arrows or setup functions");
     }
     const binding: KeymapBinding = { kind: "keymap", name, entries };
@@ -740,6 +1528,8 @@ class AppCompiler {
 
   private compileActionArrow(cName: string, arrow: ts.ArrowFunction): void {
     const saved = new Map(this.scope);
+    const prevResult = this.curFnResult;
+    this.curFnResult = "void";
     const { decls, body } = this.withOwner(cName, () => this.withHoist((out) => {
       if (ts.isBlock(arrow.body)) {
         for (const stmt of arrow.body.statements) this.compileStmt(stmt, out, "  ");
@@ -747,6 +1537,7 @@ class AppCompiler {
         this.compileExprStmt(arrow.body, out, "  ");
       }
     }));
+    this.curFnResult = prevResult;
     this.scope = saved;
     this.bodies.push(`static void ${cName}(void) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
@@ -790,6 +1581,13 @@ class AppCompiler {
     return text.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
   }
 
+  /** A single-char JS string literal as a C char literal, e.g. "#" -> '#'. */
+  private cCharLit(ch: string): string {
+    if (ch === "'") return "'\\''";
+    if (ch === "\\") return "'\\\\'";
+    return `'${ch}'`;
+  }
+
   private depRef(name: string): void {
     this.curDeps?.add(name);
   }
@@ -821,8 +1619,15 @@ class AppCompiler {
     let binding!: ComputedBinding;
     const hoisted = this.withOwner(`c_${name}_update`, () => this.withHoist((lines) => {
     if (this.isViewExpr(body)) {
-      const maxLen = this.viewMaxLen(body);
-      binding = { kind: "computed", name, index, valTy: this.viewTyOf(body), deps, maxLen };
+      const valTy = this.viewTyOf(body);
+      binding = {
+        kind: "computed",
+        name,
+        index,
+        valTy,
+        deps,
+        maxLen: valTy.k === "view" ? valTy.maxLen : 0,
+      };
       this.compileViewInto(body, `c_${name}_v`, lines, "  ");
     } else {
       const val = this.compileExpr(body, lines, "  ");
@@ -842,13 +1647,15 @@ class AppCompiler {
     const lines = [...hoisted.decls, ...hoisted.body];
     this.curDeps = prevDeps;
 
+    const viewCName =
+      binding.valTy.k === "view" ? this.viewTypeName(binding.valTy.cap) : "vp_view";
     const cTy =
       binding.valTy.k === "view"
-        ? { store: "static vp_view", accessor: "static const vp_view *", result: `&c_${name}_v` }
+        ? { store: `static ${viewCName}`, accessor: `static const ${viewCName} *`, result: `&c_${name}_v` }
         : binding.valTy.k === "obj"
           ? {
-              store: `static rec_${binding.valTy.iface.toLowerCase()} *`,
-              accessor: `static rec_${binding.valTy.iface.toLowerCase()} *`,
+              store: `static rec_${binding.valTy.iface} *`,
+              accessor: `static rec_${binding.valTy.iface} *`,
               result: `c_${name}_v`,
             }
           : { store: "static s32", accessor: "static s32 ", result: `c_${name}_v` };
@@ -898,7 +1705,29 @@ class AppCompiler {
 
   private viewTyOf(e: ts.Expression): Ty {
     const iface = this.viewIface(e);
-    return { k: "view", iface, listRef: this.viewListRef(e), maxLen: this.viewMaxLen(e) };
+    const listRef = this.viewListRef(e);
+    const cap = this.viewCap(e);
+    return { k: "view", iface, listRef, maxLen: Math.min(this.viewMaxLen(e), cap), cap };
+  }
+
+  /** Storage capacity a view must reserve: the largest source-list cap the
+   * expression can read. filter/slice never grow, so they inherit; a
+   * ternary of two lists takes the max of its arms. */
+  private viewCap(e: ts.Expression): number {
+    e = this.unparen(e);
+    if (ts.isConditionalExpression(e))
+      return Math.max(this.viewCap(e.whenTrue), this.viewCap(e.whenFalse));
+    if (ts.isCallExpression(e) && ts.isPropertyAccessExpression(e.expression)) {
+      const method = e.expression.name.text;
+      if (method === "filter" || method === "slice") return this.viewCap(e.expression.expression);
+    }
+    const base = this.valueBase(e);
+    if (base) {
+      const b = this.scope.get(base);
+      if (b?.kind === "ref") return this.listCap(b.name);
+      if (b?.kind === "computed" && b.valTy.k === "view") return b.valTy.cap;
+    }
+    return this.target.poolCap;
   }
 
   private viewIface(e: ts.Expression): string {
@@ -925,6 +1754,13 @@ class AppCompiler {
     this.err(e, "cannot resolve the list this view reads");
   }
 
+  /** Static element capacity of one list pool: its declared withCapacity
+   * value, else the target default. Views are sized to this. */
+  private listCap(refName: string): number {
+    const b = this.scope.get(refName);
+    return b?.kind === "ref" ? (b.cap ?? this.target.poolCap) : this.target.poolCap;
+  }
+
   private viewMaxLen(e: ts.Expression): number {
     e = this.unparen(e);
     if (ts.isConditionalExpression(e)) {
@@ -943,7 +1779,7 @@ class AppCompiler {
     const base = this.valueBase(e);
     if (base) {
       const b = this.scope.get(base);
-      if (b?.kind === "ref") return this.target.poolCap;
+      if (b?.kind === "ref") return this.listCap(b.name);
       if (b?.kind === "computed") return b.maxLen;
     }
     return this.target.poolCap;
@@ -1085,7 +1921,7 @@ class AppCompiler {
         out.push(`${ind}  for (${i} = 0; ${i} < ${src.len}; ${i}++) {`);
         out.push(`${ind}    rec_${iface.toLowerCase()} *${p} = g_${listRef} + (u16)(${src.at(i)});`);
         const saved = new Map(this.scope);
-        this.scope.set(param, { kind: "local", cName: p, ty: { k: "obj", iface, listRef } });
+        this.scope.set(param, { kind: "local", cName: p, ty: { k: "obj", iface, listRef, nullable: false } });
         const pred = this.compileExpr(arrow.body, out, ind + "    ");
         this.scope = saved;
         out.push(`${ind}    if (${this.condition(pred)}) ${target}.idx[${target}.len++] = ${src.at(i)};`);
@@ -1133,17 +1969,19 @@ class AppCompiler {
         return { len: `g_${b.name}_len`, at: (i) => i };
       }
       if (b?.kind === "computed" && b.valTy.k === "view") {
+        const vty = b.valTy;
         for (const d of b.deps) this.depRef(d);
         this.ovlCall(`c_${b.name}_update`);
         const v = this.tmp("v");
-        this.declare(`const vp_view *${v};`);
+        this.declare(`const ${this.viewTypeName(vty.cap)} *${v};`);
         out.push(`${ind}${v} = c_${b.name}();`);
         return { len: `${v}->len`, at: (i) => `${v}->idx[${i}]` };
       }
     }
     // nested filter/slice chain: materialize into an overlay temp view
     if (ts.isCallExpression(e)) {
-      const v = this.allocTemp("view");
+      const ty = this.viewTyOf(e);
+      const v = this.allocTemp("view", ty.k === "view" ? ty.cap : this.target.poolCap);
       this.compileViewInto(e, v, out, ind);
       return { len: `${v}.len`, at: (i) => `${v}.idx[${i}]` };
     }
@@ -1232,6 +2070,12 @@ class AppCompiler {
       const a = this.compileExpr(e.whenTrue, out, ind);
       const b = this.compileExpr(e.whenFalse, out, ind);
       if (a.ty.k !== b.ty.k) this.err(e, `ternary arms differ: ${a.ty.k} vs ${b.ty.k}`);
+      // Record pointers merge like a union: if EITHER arm can be null (an
+      // out-of-range pool index), the result can be null. Taking just the
+      // true arm's flag dropped the guards on number/boolean/putChar writes
+      // through the merged local (review task 1161 R1).
+      if (a.ty.k === "obj" && b.ty.k === "obj")
+        return { c: `(${this.truthy(c)} ? ${a.c} : ${b.c})`, ty: { ...a.ty, nullable: a.ty.nullable || b.ty.nullable } };
       return { c: `(${this.truthy(c)} ? ${a.c} : ${b.c})`, ty: a.ty };
     }
 
@@ -1293,7 +2137,24 @@ class AppCompiler {
       out.push(
         `${ind}${p} = (${idx.c} >= 0 && ${idx.c} < (s32)${src.len}) ? g_${listRef} + (u16)(${src.at(`(u8)(${idx.c})`)}) : 0;`,
       );
-      return { c: p, ty: { k: "obj", iface, listRef } };
+      return { c: p, ty: { k: "obj", iface, listRef, nullable: true } };
+    }
+
+    // record string field indexing: line.text[i] -> vp_sb_at (compileMember
+    // turns a string field into an `sb` pointer; standalone string refs too)
+    const obj = this.compileExpr(objExpr, out, ind);
+    if (obj.ty.k === "sb") {
+      this.usedSbAt = true;
+      return { c: `vp_sb_at(${obj.c}, ${idx.c})`, ty: { k: "char" } };
+    }
+    if (ts.isPropertyAccessExpression(objExpr)) {
+      const owner = this.compileExpr(objExpr.expression, out, ind);
+      if (owner.ty.k === "obj") {
+        this.err(
+          e,
+          `indexing number/boolean record fields is not supported (field ${objExpr.name.text})`,
+        );
+      }
     }
     this.err(e, "unsupported indexing");
   }
@@ -1348,11 +2209,26 @@ class AppCompiler {
         });
         this.emitFn(b);
         for (const d of b.deps) this.depRef(d);
-        this.ovlCall(`fn_${b.name}`);
-        return { c: `fn_${b.name}(${args.join(", ")})`, ty: { k: "void" } };
+        this.ovlCall(b.cName);
+        return { c: `${b.cName}(${args.join(", ")})`, ty: b.result === "num" ? NUM : { k: "void" } };
       }
     }
     this.err(e, "unsupported call");
+  }
+
+  /**
+   * A string-literal `===`/`!==` operand classified WITHOUT compiling it:
+   * a bare "x" literal or a `const` alias of one, carrying its text so it can
+   * become a C char constant instead of an interned ROM array.
+   */
+  private classifyCmpLiteral(e: ts.Expression): { text: string; node: ts.Expression } | null {
+    e = this.unparen(e);
+    if (ts.isStringLiteral(e)) return { text: e.text, node: e };
+    if (ts.isIdentifier(e)) {
+      const b = this.scope.get(e.text);
+      if (b?.kind === "const" && typeof b.value === "string") return { text: b.value, node: e };
+    }
+    return null;
   }
 
   private compileBinary(e: ts.BinaryExpression, out: string[], ind: string): { c: string; ty: Ty } {
@@ -1364,8 +2240,36 @@ class AppCompiler {
       const cop = op === K.AmpersandAmpersandToken ? "&&" : "||";
       return { c: `(${this.truthy(l)} ${cop} ${this.truthy(r)})`, ty: BOOL };
     }
-    const l = this.compileExpr(e.left, out, ind);
-    const r = this.compileExpr(e.right, out, ind);
+    let l: { c: string; ty: Ty } | undefined;
+    let r: { c: string; ty: Ty } | undefined;
+    // char vs one-char string literal: JS compares two one-char strings, but C
+    // sees `char` against a ROM `const char[N]`. gcc only warns; sdcc and
+    // cc65 reject it. Lower the literal side to a C char constant ('#').
+    if (op === K.EqualsEqualsEqualsToken || op === K.ExclamationEqualsEqualsToken) {
+      const ll = this.classifyCmpLiteral(e.left);
+      const rl = this.classifyCmpLiteral(e.right);
+      if ((ll || rl) && !(ll && rl)) {
+        const lit = (ll ?? rl)!;
+        const otherNode = ll ? e.right : e.left;
+        const other = this.compileExpr(otherNode, out, ind);
+        if (other.ty.k === "char") {
+          if (lit.text.length === 0) this.err(lit.node, "comparing a char to an empty string");
+          if (lit.text.length !== 1)
+            this.err(lit.node, "comparing a char to a multi-character string");
+          const ch = this.cCharLit(lit.text);
+          l = ll ? { c: ch, ty: { k: "char" } } : other;
+          r = rl ? { c: ch, ty: { k: "char" } } : other;
+        } else {
+          // not a char on the other side (strlit/num/...): keep the legacy
+          // pointer comparison path; the literal side emits no statements.
+          const litCompiled = this.compileExpr(lit.node, out, ind);
+          l = ll ? litCompiled : other;
+          r = rl ? litCompiled : other;
+        }
+      }
+    }
+    l ??= this.compileExpr(e.left, out, ind);
+    r ??= this.compileExpr(e.right, out, ind);
     const table: Partial<Record<ts.SyntaxKind, string>> = {
       [K.PlusToken]: "+",
       [K.MinusToken]: "-",
@@ -1423,6 +2327,14 @@ class AppCompiler {
 
   private compileStmt(stmt: ts.Statement, out: string[], ind: string): void {
     if (ts.isReturnStatement(stmt)) {
+      if (this.curFnResult === "num") {
+        if (!stmt.expression) this.err(stmt, "number helper must return a number");
+        const v = this.compileExpr(stmt.expression, out, ind);
+        if (v.ty.k !== "num" && v.ty.k !== "bool")
+          this.err(stmt.expression!, `number helper must return a number, got ${v.ty.k}`);
+        out.push(`${ind}return ${v.c};`);
+        return;
+      }
       if (stmt.expression) this.err(stmt, "handlers cannot return values");
       out.push(`${ind}return;`);
       return;
@@ -1437,8 +2349,22 @@ class AppCompiler {
         return;
       }
       const cond = this.compileExpr(stmt.expression, out, ind);
+      // `if (t)` narrows a nullable record-pointer local to non-null inside
+      // the then branch: the idiomatic guard `const t = list.value[i]; if (t)
+      // t.f = ...` then needs no runtime null check of its own.
+      const guardName =
+        ts.isIdentifier(this.unparen(stmt.expression)) ? this.unparen(stmt.expression).getText(this.sf) : null;
+      const guardBinding = guardName ? this.scope.get(guardName) : undefined;
+      const narrowed =
+        guardBinding?.kind === "local" && guardBinding.ty.k === "obj" && guardBinding.ty.nullable;
       out.push(`${ind}if (${this.condition(cond)}) {`);
+      if (narrowed) {
+        const b = guardBinding as Extract<Binding, { kind: "local" }>;
+        const ty = b.ty as Extract<Ty, { k: "obj" }>;
+        this.scope.set(guardName!, { ...b, ty: { ...ty, nullable: false } });
+      }
       this.compileStmt(stmt.thenStatement, out, ind + "  ");
+      if (narrowed) this.scope.set(guardName!, guardBinding as Extract<Binding, { kind: "local" }>);
       if (stmt.elseStatement) {
         out.push(`${ind}} else {`);
         this.compileStmt(stmt.elseStatement, out, ind + "  ");
@@ -1621,7 +2547,7 @@ class AppCompiler {
           this.err(rhs, "list refs can only be assigned a filter/slice view");
         if (this.viewListRef(this.unparen(rhs)) !== b.name)
           this.err(rhs, "list assignment must derive from the same list");
-        const nv = this.allocTemp("view");
+        const nv = this.allocTemp("view", this.listCap(b.name));
         const k = this.tmp("k");
         out.push(`${ind}{ u8 ${k};`);
         this.compileViewInto(this.unparen(rhs), nv, out, ind + "  ");
@@ -1640,16 +2566,103 @@ class AppCompiler {
       const iface = this.ifaces.get(obj.ty.iface)!;
       const field = iface.fields.find((f) => f.name === lhs.name.text);
       if (!field) this.err(lhs, `no field ${lhs.name.text} on ${obj.ty.iface}`);
-      if (field.ty === "str") this.err(lhs, "string field writes only via push");
+      // A pointer that came from a pool index can be null (index out of
+      // range): writing its fields dereferences address 0 and hangs the GBA.
+      // Reuse a simple local (`l_ln_1`); otherwise materialize the indexing
+      // expression once into a guarded temp. Non-nullable sources
+      // (map/filter locals, pushed records, or `if (t)`-narrowed pointers)
+      // keep the exact old code shape.
+      let ptr = obj.c;
+      if (obj.ty.nullable && !/^\w+$/.test(obj.c)) {
+        const gp = this.tmp("gw");
+        this.declare(`rec_${obj.ty.iface.toLowerCase()} *${gp};`);
+        out.push(`${ind}${gp} = ${obj.c};`);
+        ptr = gp;
+      }
+      if (field.ty === "str") {
+        if (this.compilePutCharField(lhs, ptr, obj.ty.listRef, rhs, out, ind, obj.ty.nullable)) return;
+        this.err(
+          lhs,
+          "string field writes only via push, or `t.s = putChar(t.s, i, ch)` for one byte",
+        );
+      }
       const v = this.compileExpr(rhs, out, ind);
       const tmp = this.tmp("fv");
       const cast = field.ty === "bool" ? "(u8)" : "(s32)";
-      out.push(
-        `${ind}{ ${field.ty === "bool" ? "u8" : "s32"} ${tmp} = ${cast}(${this.truthy(v)}); if (${obj.c}->${lhs.name.text} != ${tmp}) { ${obj.c}->${lhs.name.text} = ${tmp}; ${this.markCode(obj.ty.listRef)}; } }`,
-      );
+      const write =
+        `{ ${field.ty === "bool" ? "u8" : "s32"} ${tmp} = ${cast}(${this.truthy(v)}); ` +
+        `if (${ptr}->${lhs.name.text} != ${tmp}) { ${ptr}->${lhs.name.text} = ${tmp}; ${this.markCode(obj.ty.listRef)}; } }`;
+      if (obj.ty.nullable) {
+        out.push(`${ind}if (!${ptr}) vp_tripwires |= VP_TRIP_NULL; else ${write}`);
+      } else {
+        out.push(`${ind}${write}`);
+      }
       return;
     }
+    // line.text[i] = c: a silent no-op under real Vue (strings are immutable);
+    // the subset spells it `line.text = putChar(line.text, i, c)`.
+    if (ts.isElementAccessExpression(lhs)) {
+      this.err(lhs, "indexed string assignment is a no-op in Vue; use `t.s = putChar(t.s, i, ch)`");
+    }
     this.err(lhs, "unsupported assignment target");
+  }
+
+  /**
+   * Recognize `t.f = putChar(t.f, i, ch)` and lower it to one in-place byte
+   * store. The first argument must name the same record string field as the
+   * assignment target (the oracle rebuilds that exact string); `ch` must be
+   * a single char — a const-string/record-string index or a one-char literal.
+   * Returns true when the intrinsic was compiled.
+   */
+  private compilePutCharField(
+    lhs: ts.PropertyAccessExpression,
+    recC: string,
+    listRef: string,
+    rhs: ts.Expression,
+    out: string[],
+    ind: string,
+    nullable = false,
+  ): boolean {
+    rhs = this.unparen(rhs);
+    if (!ts.isCallExpression(rhs)) return false;
+    const callee = this.unparen(rhs.expression);
+    if (!ts.isIdentifier(callee) || callee.text !== this.hostPutChar || !this.hostPutChar) return false;
+    const [target, idxNode, chNode] = rhs.arguments;
+    if (rhs.arguments.length !== 3 || !target || !idxNode || !chNode)
+      this.err(rhs, "putChar takes exactly (text, index, char)");
+
+    // arg0 must be the same field access as the assignment target
+    const ta = this.unparen(target);
+    if (
+      !ts.isPropertyAccessExpression(ta) ||
+      ta.name.text !== lhs.name.text ||
+      ta.expression.getText(this.sf) !== lhs.expression.getText(this.sf)
+    ) {
+      this.err(
+        target,
+        `putChar must edit the assigned field: write \`${lhs.getText(this.sf)} = putChar(${lhs.getText(this.sf)}, i, ch)\``,
+      );
+    }
+
+    const idx = this.compileExpr(idxNode, out, ind);
+    if (idx.ty.k !== "num") this.err(idxNode, "putChar index must be a number");
+
+    let ch: { c: string; ty: Ty };
+    if (ts.isStringLiteral(chNode)) {
+      if (chNode.text.length !== 1)
+        this.err(chNode, `putChar char must be one character, got a ${chNode.text.length}-char literal`);
+      ch = { c: this.cCharLit(chNode.text), ty: { k: "char" } };
+    } else {
+      ch = this.compileExpr(chNode, out, ind);
+      if (ch.ty.k !== "char")
+        this.err(chNode, "putChar char must be a single char (a string index or a one-char literal)");
+    }
+
+    this.usedSbPut = true;
+    const put = `if (vp_sb_put(&${recC}->${lhs.name.text}, ${idx.c}, ${ch.c})) ${this.markCode(listRef)};`;
+    if (nullable) out.push(`${ind}if (!${recC}) vp_tripwires |= VP_TRIP_NULL; else ${put}`);
+    else out.push(`${ind}${put}`);
+    return true;
   }
 
   private compilePush(listExpr: ts.Expression, call: ts.CallExpression, out: string[], ind: string): void {
@@ -1659,8 +2672,8 @@ class AppCompiler {
     const arg = call.arguments[0];
     if (!arg || !ts.isObjectLiteralExpression(arg)) this.err(call, "push takes an object literal");
     const iface = this.ifaces.get(b.iface!)!;
-    out.push(`${ind}if (g_${listRef}_len < ${this.target.poolCap}) {`);
-    out.push(`${ind}  rec_${iface.name.toLowerCase()} *np = g_${listRef} + (u16)(g_${listRef}_len++);`);
+    out.push(`${ind}if (g_${listRef}_len < ${this.listCap(listRef)}) {`);
+    out.push(`${ind}  rec_${iface.id} *np = g_${listRef} + (u16)(g_${listRef}_len++);`);
     for (const propNode of arg.properties) {
       if (!ts.isPropertyAssignment(propNode) || !ts.isIdentifier(propNode.name))
         this.err(propNode, "push object must use `field: value`");
@@ -1703,15 +2716,24 @@ class AppCompiler {
     b.emitted = true; // set first: recursion guard
     const prevDeps = this.curDeps;
     this.curDeps = b.deps;
+    const prevResult = this.curFnResult;
+    this.curFnResult = b.result;
     const saved = new Map(this.scope);
-    const { decls, body } = this.withOwner(`fn_${b.name}`, () => this.withHoist((out) => {
-      for (const p of b.params) this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: NUM });
+    // An imported-module helper compiles against its own module's scope
+    // (its consts, interfaces, and sibling helpers), not the component scope.
+    if (b.moduleScope) this.scope = new Map(b.moduleScope);
+    const { decls, body } = this.withOwner(b.cName, () => this.withHoist((out) => {
+      b.params.forEach((p, i) =>
+        this.scope.set(p, { kind: "local", cName: `p_${p}`, ty: b.paramTys[i] === "bool" ? BOOL : NUM }),
+      );
       for (const stmt of b.decl.body!.statements) this.compileStmt(stmt, out, "  ");
     }));
     this.scope = saved;
+    this.curFnResult = prevResult;
     this.curDeps = prevDeps;
     const sig = b.params.length ? b.params.map((p) => `s32 p_${p}`).join(", ") : "void";
-    this.bodies.push(`static void fn_${b.name}(${sig}) {\n${[...decls, ...body].join("\n")}\n}\n`);
+    const ret = b.result === "num" ? "s32" : "void";
+    this.bodies.push(`static ${ret} ${b.cName}(${sig}) {\n${[...decls, ...body].join("\n")}\n}\n`);
   }
 
   // ---- JSX -> effects -------------------------------------------------------
@@ -2049,7 +3071,7 @@ class AppCompiler {
     body.push(`    rec_${iface.toLowerCase()} *${pV} = g_${listRef} + (u16)(${src.at(iV)});`);
 
     const saved = new Map(this.scope);
-    this.scope.set(itemParam, { kind: "local", cName: pV, ty: { k: "obj", iface, listRef } });
+    this.scope.set(itemParam, { kind: "local", cName: pV, ty: { k: "obj", iface, listRef, nullable: false } });
     this.scope.set(indexParam, { kind: "local", cName: `(s32)${iV}`, ty: NUM });
     const { src: rowSrc, ctx } = this.resolveRenderable(rowJsx);
     const prevCtx = this.propsCtx;
@@ -2099,6 +3121,8 @@ class AppCompiler {
     let handlerOut: string[] = [];
     {
       const saved = new Map(this.scope);
+      const prevResult = this.curFnResult;
+      this.curFnResult = "void";
       const param = this.handler.parameters[0]?.name.getText(this.sf);
       if (!param) this.err(this.handler, "onButton arrow needs a (b) param");
       this.scope.set(param, { kind: "local", cName: "b_arg", ty: NUM });
@@ -2110,6 +3134,7 @@ class AppCompiler {
           this.compileExprStmt(handlerArrow.body, out, "  ");
         }
       }));
+      this.curFnResult = prevResult;
       handlerOut = [...decls, ...body];
       this.scope = saved;
     }
@@ -2118,6 +3143,8 @@ class AppCompiler {
     const axisHandlerCases: string[] = [];
     for (const [axis, handler] of [...this.axisHandlers].sort(([a], [b]) => a - b)) {
       const saved = new Map(this.scope);
+      const prevResult = this.curFnResult;
+      this.curFnResult = "void";
       const parameter = handler.parameters[0];
       if (!parameter || !ts.isIdentifier(parameter.name))
         this.err(handler, "onAxisDelta arrow needs a simple delta parameter");
@@ -2133,6 +3160,7 @@ class AppCompiler {
           this.compileExprStmt(handler.body, out, "  ");
         }
       }));
+      this.curFnResult = prevResult;
       axisHandlerFns.push(
         `static void vp_axis_handler_${axis}(s32 axis_delta_arg) {\n${[...decls, ...body].join("\n")}\n}`,
       );
@@ -2155,7 +3183,8 @@ class AppCompiler {
       } else {
         const arr = ref.seed as ts.ArrayLiteralExpression;
         const iface = this.ifaces.get(ref.iface!)!;
-        if (arr.elements.length > this.target.poolCap) this.err(arr, `seed exceeds pool capacity ${this.target.poolCap}`);
+        const cap = this.listCap(ref.name);
+        if (arr.elements.length > cap) this.err(arr, `seed exceeds pool capacity ${cap}`);
         initOut.push(`  g_${ref.name}_len = ${arr.elements.length};`);
         arr.elements.forEach((el, i) => {
           if (!ts.isObjectLiteralExpression(el)) this.err(el, "list seeds are object literals");
@@ -2235,15 +3264,33 @@ class AppCompiler {
       "static inline const char *VP_UNUSED_FN vp_cstr_at(const char *const *arr, s32 n, s32 i) { return (i >= 0 && i < n) ? arr[i] : (const char *)\"\"; }",
     );
     c.push("static inline char VP_UNUSED_FN vp_char_at(const char *s, s32 n, s32 i) { return (i >= 0 && i < n) ? s[i] : ' '; }");
+    // Record string-field helpers are on-demand: the flags are set while
+    // lowering (all handler/effect bodies compile before this assembly), so
+    // apps like todo that never touch a record string byte pay nothing.
+    if (this.usedSbAt)
+      c.push(
+        "static inline char VP_UNUSED_FN vp_sb_at(const vp_sb *s, s32 i) { return (i >= 0 && i < (s32)s->len) ? s->b[i] : ' '; }",
+      );
+    // putChar intrinsic. Out-of-range indices trip VP_TRIP_INDEX and leave
+    // the string untouched; returns changed, gating the caller's vp_mark.
+    // The `!=` guard (not an equality early return) avoids a cc65 2.18 -O crash.
+    if (this.usedSbPut)
+      c.push(
+        "static inline u8 VP_UNUSED_FN vp_sb_put(vp_sb *s, s32 i, char c) { if (i < 0 || i >= (s32)s->len) { vp_tripwires |= VP_TRIP_INDEX; return 0; } if (s->b[i] != c) { s->b[i] = c; return 1; } return 0; }",
+      );
     c.push("");
 
     // record structs
     for (const iface of this.ifaces.values()) {
-      const fields = iface.fields
+      const fields = this.recordFields(iface)
         .map((f) => (f.ty === "str" ? `vp_sb ${f.name};` : f.ty === "bool" ? `u8 ${f.name};` : `s32 ${f.name};`))
         .join(" ");
-      c.push(`typedef struct { ${fields} } rec_${iface.name.toLowerCase()};`);
+      c.push(`typedef struct { ${fields} } rec_${iface.id};`);
     }
+    // Per-list view types: a declared withCapacity cap narrows (or widens)
+    // the idx[] array vs the runtime's default-capped vp_view.
+    for (const cap of this.allViewCaps())
+      c.push(`typedef struct { u8 len; u8 idx[${cap}]; } ${this.viewTypeName(cap)};`);
     c.push("");
 
     // state
@@ -2251,7 +3298,7 @@ class AppCompiler {
       if (ref.refTy === "num") c.push(`static s32 g_${ref.name};`);
       else if (ref.refTy === "bool") c.push(`static s32 g_${ref.name};`);
       else if (ref.refTy === "str") c.push(`static vp_sb g_${ref.name};`);
-      else c.push(`static rec_${ref.iface!.toLowerCase()} g_${ref.name}[${this.target.poolCap}]; static u8 g_${ref.name}_len;`);
+      else c.push(`static rec_${ref.iface!.toLowerCase()} g_${ref.name}[${this.listCap(ref.name)}]; static u8 g_${ref.name}_len;`);
     }
     c.push("static u32 vp_dirty; static u32 c_valid;");
     c.push(`static const u32 C_INVAL[${Math.max(1, cInval.length)}] = { ${cInval.map((m) => `0x${m.toString(16)}u`).join(", ") || "0"} };`);
@@ -2275,16 +3322,21 @@ class AppCompiler {
     // handler
     c.push(`void app_on_button(u8 b) {\n  s32 b_arg = (s32)b;\n${handlerOut.join("\n")}\n}\n`);
     c.push(axisHandlerFns.join("\n\n"));
-    if (axisHandlerCases.length > 0) {
-      c.push(
-        `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
-          "\n",
-        )}\n    default: break;\n  }\n}\n`,
-      );
-    } else {
-      c.push(
-        "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
-      );
+    // Only Playdate's runtime calls app_on_axis_delta unconditionally; the
+    // console/ESP32 runtimes never reference it, and their targets reject axis
+    // registrations at compile time (VT102), so no definition is emitted there.
+    if (axisHandlerCases.length > 0 || this.target.name === "playdate") {
+      if (axisHandlerCases.length > 0) {
+        c.push(
+          `void app_on_axis_delta(u8 axis, s32 delta) {\n  switch (axis) {\n${axisHandlerCases.join(
+            "\n",
+          )}\n    default: break;\n  }\n}\n`,
+        );
+      } else {
+        c.push(
+          "void app_on_axis_delta(u8 axis, s32 delta) {\n  (void)axis;\n  (void)delta;\n}\n",
+        );
+      }
     }
 
     // flush
@@ -2327,7 +3379,9 @@ class AppCompiler {
       throw new Error(this.styleErrors.join("\n"));
     }
     c.push(emitTargetData(this.target, this.styleTable));
-    c.push(`const char vp_app_title[] = "${this.escC(this.title)}";`);
+    // No C symbol for the cartridge title: the GBA/GB header patches write
+    // the bytes from app.title on the JS side (rom.ts), and none of the
+    // runtimes read it (Playdate uses app.title for its bundle metadata).
     c.push("");
 
     // ---- reports ----
@@ -2374,22 +3428,22 @@ class AppCompiler {
     const pools = this.refs.filter((r) => r.refTy === "list");
     const poolBytes = pools.reduce((acc, p) => {
       const iface = this.ifaces.get(p.iface!)!;
-      const rec = iface.fields.reduce((a, f) => a + (f.ty === "str" ? this.target.strCap + 1 : f.ty === "bool" ? 1 : 4), 0);
-      return acc + rec * this.target.poolCap + 1;
+      return acc + this.recordStride(iface) * this.listCap(p.name) + 1;
     }, 0);
-    const viewBytes =
-      this.computeds.filter((comp) => comp.valTy.k === "view").length * (this.target.poolCap + 1);
+    const viewBytes = this.computeds.reduce(
+      (a, comp) => (comp.valTy.k === "view" ? a + 1 + comp.valTy.cap : a),
+      0,
+    );
     const scalarBytes = this.refs
       .filter((r) => r.refTy !== "list")
       .reduce((a, r) => a + (r.refTy === "str" ? this.target.strCap + 1 : 4), 0);
-    const romStrings =
-      [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0) + this.title.length + 1;
+    const romStrings = [...this.strLits.keys()].reduce((a, s) => a + s.length + 1, 0);
     const pairCount = this.styleTable.pairs.length;
     const fontBytes =
       this.target.name === "esp32" || this.target.name === "playdate" ? 95 * 8 : 95 * 32;
     const styleBytes =
       this.target.name === "gba"
-        ? pairCount * 16 * 2 + pairCount + 3
+        ? pairCount * 16 * 2 + 2 // palette banks + palette_count/backdrop; no vp_pal_style
         : this.target.name === "esp32"
           ? pairCount * 2 * 2 + pairCount + 2
           : pairCount;
@@ -2501,6 +3555,9 @@ export function nesFontBytes(): number[] {
 
 function emitTargetData(target: VaporTarget, styles: StyleTable): string {
   const lowered = styles.lower(target.name);
+  // GB, NES and Playdate index glyph style through this table at render time;
+  // GBA and ESP32 read palette banks / RGB565 pairs directly, so they never
+  // emit it.
   const styleTable = `const u8 vp_pal_style[${styles.pairs.length}] = { ${lowered.styleMap.join(",")} };`;
 
   switch (target.name) {
@@ -2516,8 +3573,7 @@ function emitTargetData(target: VaporTarget, styles: StyleTable): string {
         `${emitFontGba()}\n` +
         `const u16 vp_palettes[] = { ${banks.join(",")} };\n` +
         `const u8 vp_palette_count = ${styles.pairs.length};\n` +
-        `const u16 vp_backdrop = ${rgb555(BACKDROP)};\n` +
-        styleTable
+        `const u16 vp_backdrop = ${rgb555(BACKDROP)};`
       );
     }
     case "esp32": {
