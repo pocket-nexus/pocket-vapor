@@ -6,6 +6,7 @@
  *
  * Scenario: one command per line:
  *   A <frames>                       advance
+ *   K <keymask-hex>                  set keys without advancing
  *   P <keymask-hex> <hold> <release> press keys, run hold frames, release,
  *                                    run release frames
  *   R <name> <addr-hex> <size>       read 1/2/4 bytes little-endian
@@ -105,6 +106,10 @@ int main(int argc, char **argv) {
       int n = 0;
       sscanf(line + 1, "%d", &n);
       run_frames(n);
+    } else if (op == 'K') {
+      unsigned mask = 0;
+      sscanf(line + 1, "%x", &mask);
+      core->setKeys(core, mask);
     } else if (op == 'P') {
       unsigned mask = 0;
       int hold = 0, release = 0;
