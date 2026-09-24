@@ -1,6 +1,7 @@
 // vapor/test/compiler.test.ts — subset diagnostics + deterministic output.
 
 import { describe, expect, test } from "bun:test";
+import { $ } from "bun";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import { loadBoard } from "../compiler/boards.ts";
 import { compileVaporApp, VAPOR_TARGETS, VaporCompileError } from "../compiler/compile.ts";
 import { esp32BuildId } from "../compiler/esp32.ts";
 import { FONT8 } from "../compiler/font.gen.ts";
+import { buildRom } from "../compiler/rom.ts";
 
 const ENTRY = join(import.meta.dir, "..", "examples", "todo", "todo.tsx");
 const TODO_SOURCE = await Bun.file(ENTRY).text();
@@ -537,4 +539,203 @@ describe("dead data and dead functions are not emitted", () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+});
+
+const CAP_HEADER = `
+import { computed, ref } from "vue";
+import { Button, onButton } from "../../host/input.ts";
+import { withCapacity } from "../../host/list.ts";
+`;
+
+// Two lists that used to share one global poolCap now size independently:
+// a 12-record string-row board and a 64-deep undo stack must coexist on NES.
+const CAP_SRC = `${CAP_HEADER}
+interface Line { text: string }
+interface Hist { d: boolean }
+export default () => {
+  const rows = ref<Line[]>(withCapacity([
+    { text: "a" }, { text: "b" }, { text: "c" }, { text: "d" },
+    { text: "e" }, { text: "f" }, { text: "g" }, { text: "h" },
+    { text: "i" }, { text: "j" }, { text: "k" }, { text: "l" },
+  ], 12));
+  const hist = ref<Hist[]>(withCapacity([], 64));
+  onButton((b) => { if (b === Button.A) hist.value.push({ d: false }); });
+  return (<>
+    {rows.value.map((r, i) => <row y={i}>{r.text}</row>)}
+    <row y={13}>{hist.value.length}</row>
+  </>);
+};
+`;
+
+const CAP_VIEW_SRC = `${CAP_HEADER}
+interface It { n: number }
+export default () => {
+  const items = ref<It[]>(withCapacity([{ n: 1 }, { n: 2 }], 12));
+  const live = computed(() => items.value.filter((x) => x.n > 0));
+  onButton((b) => {});
+  return (<>{live.value.map((x, i) => <row y={i}>{x.n}</row>)}</>);
+};
+`;
+
+describe("per-pool static capacity (withCapacity)", () => {
+  test("each list gets its own declared C-array size and push guard", () => {
+    const app = compileVaporApp("cap.tsx", CAP_SRC, "CAP", "nes");
+    expect(app.c).toContain("g_rows[12]");
+    expect(app.c).toContain("g_hist[64]");
+    // the push guard compares against THIS pool's cap, not the global 8
+    expect(app.c).toContain("if (g_hist_len < 64)");
+    expect(app.c).not.toContain("if (g_hist_len < 8)");
+    // no per-cap view typedef is emitted when no view needs one
+    expect(app.c).not.toContain("vp_view12");
+  });
+
+  test("plan accounts for pools with distinct capacities", () => {
+    // NES: Line is one vp_sb = strCap 20 + 1 = 21 B * 12 + 1 = 253;
+    //      Hist is one bool = 1 B * 64 + 1 = 65.
+    const nes = compileVaporApp("cap.tsx", CAP_SRC, "CAP", "nes");
+    expect(nes.plan.split("\n")[0]).toContain("318 B pools");
+    // GBA: Line is one vp_sb = 25 B (no s32 field -> no tail padding)
+    //      * 12 + 1 = 301; Hist one bool = 1 * 64 + 1 = 65.
+    const gba = compileVaporApp("cap.tsx", CAP_SRC, "CAP", "gba");
+    expect(gba.plan.split("\n")[0]).toContain("366 B pools");
+  });
+
+  test("a view of a declared-cap list is sized to that list", () => {
+    const nes = compileVaporApp("capview.tsx", CAP_VIEW_SRC, "CAPV", "nes");
+    expect(nes.c).toContain("typedef struct { u8 len; u8 idx[12]; } vp_view12;");
+    expect(nes.c).toContain("static vp_view12 c_live_v;");
+    expect(nes.plan.split("\n")[0]).toContain("13 B computed views");
+    // pool keeps the declared 12 even though the seed has 2
+    expect(nes.c).toContain("g_items[12]");
+  });
+
+  test("an unannotated list keeps the target default (todo shape unchanged)", () => {
+    const src = `${CAP_HEADER}
+interface It { n: number }
+export default () => {
+  const items = ref<It[]>([{ n: 1 }]);
+  onButton((b) => { if (b === Button.A) items.value.push({ n: 2 }); });
+  return (<>{items.value.map((x, i) => <row y={i}>{x.n}</row>)}</>);
+};
+`;
+    const nes = compileVaporApp("d.tsx", src, "D", "nes");
+    expect(nes.c).toContain("g_items[8]");
+    expect(nes.c).toContain("if (g_items_len < 8)");
+    expect(nes.c).not.toMatch(/vp_view\d/);
+    const gba = compileVaporApp("d.tsx", src, "D", "gba");
+    expect(gba.c).toContain("g_items[32]");
+  });
+
+  test("rejects non-constant, non-positive, oversized, and seed-exceeding caps", () => {
+    const wrap = (capArg: string) =>
+      `${CAP_HEADER}
+interface It { n: number }
+export default () => {
+  const k = ref(30);
+  const items = ref<It[]>(withCapacity([], ${capArg}));
+  onButton((b) => { if (b === Button.A) k.value = k.value + 1; });
+  return (<>{items.value.map((x, i) => <row y={i}>{x.n}</row>)}</>);
+};
+`;
+    // k is written in the handler, so SCCP cannot fold it: the cap is not
+    // a compile-time integer and must be rejected.
+    expect(compileErr(wrap("k.value"))).toContain("capacity must be a positive compile-time integer");
+    expect(compileErr(wrap("0"))).toContain("capacity must be a positive compile-time integer");
+    expect(compileErr(wrap("256"))).toContain("must fit in u8 (max 255)");
+    expect(compileErr(wrap("6 - 10"))).toContain("capacity must be a positive compile-time integer");
+    const seedTooBig = `${CAP_HEADER}
+interface It { n: number }
+export default () => {
+  const items = ref<It[]>(withCapacity([{n:1},{n:2}], 1));
+  onButton((b) => {});
+  return (<>{items.value.map((x, i) => <row y={i}>{x.n}</row>)}</>);
+};
+`;
+    expect(compileErr(seedTooBig)).toContain("capacity 1 is smaller than the 2-element seed");
+  });
+
+  test("rejects withCapacity on a non-list ref and a wrong argument count", () => {
+    const onNum = `${CAP_HEADER}
+export default () => {
+  const n = ref(withCapacity(0, 4));
+  onButton((b) => {});
+  return (<row y={0}>{n.value}</row>);
+};
+`;
+    expect(compileErr(onNum)).toContain("withCapacity only annotates list refs");
+    const arity = `${CAP_HEADER}
+interface It { n: number }
+export default () => {
+  const items = ref<It[]>(withCapacity([]));
+  onButton((b) => {});
+  return (<>{items.value.map((x, i) => <row y={i}>{x.n}</row>)}</>);
+};
+`;
+    expect(compileErr(arity)).toContain("withCapacity takes exactly (seedArray, capacity)");
+  });
+
+  // The device half of the contract: the 12-row board + 64-deep undo stack
+  // must fit NES RAM, the 65th push must trip VP_TRIP_POOL_FULL (never
+  // overrun the array), and tripwires must stay clear through 64 pushes.
+  const NES_RUNNER = join(import.meta.dir, "harness", "nes_runner.ts");
+  const CAP_FIXTURE = join(import.meta.dir, "fixtures", "capacity.tsx");
+
+  test("nes links a 12-row string board plus a 64-entry pool", async () => {
+    const source = await Bun.file(CAP_FIXTURE).text();
+    const app = compileVaporApp(CAP_FIXTURE, source, "CAP", "nes");
+    expect(app.plan.split("\n")[0]).toContain("318 B pools");
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-cap-"));
+    try {
+      const rom = join(dir, "cap.nes");
+      await buildRom(app, "nes", rom); // throws on ld65 RAM overflow
+      const bytes = (await Bun.file(rom).stat()).size;
+      expect(bytes).toBe(40976);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("nes: 64 pushes keep tripwire clear, the 65th trips POOL_FULL", async () => {
+    const source = await Bun.file(CAP_FIXTURE).text();
+    const app = compileVaporApp(CAP_FIXTURE, source, "CAP", "nes");
+    const dir = await mkdtemp(join(tmpdir(), "pocket-vapor-cap-run-"));
+    try {
+      const rom = join(dir, "cap.nes");
+      await buildRom(app, "nes", rom);
+      // vp_dbg_state starts at $0210 (after the 16-byte header). The two
+      // refs are rows(listLen s32 @+0) then hist(listLen s32 @+4); trips
+      // byte VP_TRIP_POOL_FULL lives at $020c.
+      const STATE = 0x0210;
+      const TRIPS = 0x020c;
+      const lines = ["A 5"];
+      const probe = (at: number) => [
+        `D len${at} 0x${STATE.toString(16)} 8`,
+        `R trips${at} 0x${TRIPS.toString(16)} 1`,
+      ];
+      lines.push(...probe(0));
+      for (let i = 1; i <= 65; i++) {
+        lines.push("P 1 2 8"); // Button.A
+        lines.push(...probe(i));
+      }
+      const scenario = join(dir, "cap.txt");
+      await Bun.write(scenario, lines.join("\n") + "\n");
+      const out = await $`bun ${NES_RUNNER} ${rom} ${scenario}`.text();
+      const parsed = JSON.parse(out) as { ok: boolean; reads: Record<string, string | number> };
+      expect(parsed.ok).toBe(true);
+      // debug bytes are dumped in address order; s32 len is little-endian,
+      // hist len is the second 4 bytes (hex chars 8..15).
+      const histLen = (at: number) => {
+        const hex = parsed.reads[`len${at}`] as string;
+        const b0 = parseInt(hex.slice(8, 10), 16);
+        const b1 = parseInt(hex.slice(10, 12), 16);
+        return b0 | (b1 << 8);
+      };
+      expect(histLen(64)).toBe(64);
+      expect(parsed.reads["trips64"]).toBe(0);
+      expect(histLen(65)).toBe(64); // guarded: length does not run past
+      expect((parsed.reads["trips65"] as number) & 1).toBe(1); // VP_TRIP_POOL_FULL
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
 });

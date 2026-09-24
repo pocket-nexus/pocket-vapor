@@ -154,3 +154,44 @@ describe("pooled string-row board oracle (vp_sb_at + putChar)", () => {
     o.unmount();
   });
 });
+
+// withCapacity is the identity under real Vue: the declared capacity is a
+// device-only static allocation, never a bound on the JS array. So the 64
+// here must NOT cap oracle growth — the same source grows unbounded in JS
+// while the compiled device trips POOL_FULL on push 65. That two-life split
+// is the contract of host/list.ts.
+const CAP_ENTRY = join(import.meta.dir, "fixtures", "capacity-entry.ts");
+const CAP_SRC_PATH = join(import.meta.dir, "fixtures", "capacity.tsx");
+const capStyles = compileVaporApp(
+  CAP_SRC_PATH,
+  await Bun.file(CAP_SRC_PATH).text(),
+  "CAP",
+  "nes",
+).styles;
+const bootCap = () => bootOracle({ width: 22, height: 18, styles: capStyles, entry: CAP_ENTRY });
+
+describe("per-pool capacity oracle (withCapacity is identity)", () => {
+  test("12 seeded string rows render and the undo stack pushes/pops", async () => {
+    const o = await bootCap();
+    for (let y = 0; y < 12; y++) expect(o.grid().chars[y]).toBe("..........".padEnd(22));
+    expect(o.grid().chars[13].trim()).toBe("0");
+
+    await o.press(Button.A);
+    await o.press(Button.A);
+    expect(o.grid().chars[13].trim()).toBe("2");
+
+    await o.press(Button.B); // splice newest
+    expect(o.grid().chars[13].trim()).toBe("1");
+    o.unmount();
+  });
+
+  test("the declared 64 does not bound the oracle array past 64", async () => {
+    const o = await bootCap();
+    for (let i = 0; i < 70; i++) await o.press(Button.A);
+    // JS keeps growing; the device counterpart trips VP_TRIP_POOL_FULL at 65
+    expect(o.grid().chars[13].trim()).toBe("70");
+    await o.press(Button.B);
+    expect(o.grid().chars[13].trim()).toBe("69");
+    o.unmount();
+  });
+});
