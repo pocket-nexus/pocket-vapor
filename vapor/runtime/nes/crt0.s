@@ -7,7 +7,17 @@
 .importzp sp, tmp1
 .import _stage_n, _stage_hi, _stage_lo, _stage_data, _nmi_count
 
+; cc65 force-imports __STARTUP__ from every C TU. The stock none.lib crt0
+; satisfies it with initlib/zerobss/copydata + a condes constructor table
+; (a 37-byte DATA block even when the table is empty). This reset vector IS
+; the startup: it clears all RAM itself and jumps straight to _main, so we
+; define __STARTUP__ as an empty marker and keep lib crt0.o/condes.o out of
+; the link entirely.
+.export __STARTUP__
+
 .segment "CODE"
+
+__STARTUP__:
 
 reset:
     sei

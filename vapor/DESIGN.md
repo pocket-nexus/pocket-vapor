@@ -149,13 +149,67 @@ Enforced with diagnostics, not documentation. In:
   is the null check).
 - **Setup helpers with parameters**: `function moveCursor(d: number)` —
   compiled to real C functions with `s32` params (annotation required);
-  callable from actions, handlers, and each other.
+  callable from actions, handlers, and each other. A helper annotated
+  `: number` (e.g. `function cellAt(x: number, y: number): number`) is a
+  **pure function**: it compiles to `static s32 fn_cellAt(s32, s32)` and the
+  call site is an expression usable in arithmetic, `if` conditions, JSX
+  interpolations, computeds, and other helpers. Purity is enforced, not
+  assumed — the body may read refs/records and call other number helpers,
+  but any `.value`/field write, `++`/`--` on a ref, or `push`/`splice` is a
+  compile error ("helpers that return a number must be pure"), and a number
+  helper cannot call a void helper. Parameters are `: number` or `: boolean`
+  (both lower to `s32`; bool just documents a 0/1 argument); every path must
+  return. This keeps the helper out of the reactive graph — it marks nothing
+  and owns no dirty bit, so callers' dependency masks stay exact. Void
+  helpers and `onButton`/keymap actions still cannot return a value.
 - **Const objects** (`const PAL = { title: 1, ... }`) fold at member
   access; const string/string[] fold `.length` and index.
+- **Record string fields index like ROM strings**: `line.text[i]` reads one
+  byte (`vp_sb_at`, space sentinel out of range). A single byte is edited in
+  place through the amphibious `putChar` host helper —
+  `line.text = putChar(line.text, i, ch)` (ch a string index or one-char
+  literal); under real Vue it rebuilds the immutable string, the compiler
+  lowers it to one bounded byte store plus `vp_mark` (out-of-range writes
+  trip `VP_TRIP_INDEX` and change nothing). Direct `line.text[i] = ch` is
+  rejected: it is a silent no-op under real Vue.
+  - **Out-of-range reads diverge from real Vue and must not be relied on.**
+    With `i < 0 || i >= line.text.length`, the device returns the space
+    sentinel `' '`, while real Vue returns `undefined`; interpolating it
+    renders one space on device and nothing in the oracle. No tripwire
+    fires for such reads (only out-of-range *writes* trip). Code that
+    classifies cells by comparing against a space — e.g. reading level text
+    past a row's end — therefore takes different branches on the two sides.
+    Treat an out-of-range index as outside the subset and guard it at the
+    call site: `x >= 0 && x < line.text.length ? line.text[x] : CH[empty]`
+    (the lower bound matters too: a negative `x` renders a space on device
+    but nothing in the oracle). The Sokoban board never depends on the
+    space sentinel.
+- **Local const modules**: `import { X, Y } from "./levels.ts"` pulls in a
+  relative-path module that may only declare `export const` literals
+  (number / string / string[] / `{name: number}`), closed `export interface`s,
+  and `export function` subset helpers (number params, void). No `vue`/host
+  imports, refs, JSX, or side effects — violations carry file:line:col from
+  the imported file, and circular imports are rejected. Module consts fold
+  exactly like in-file consts; module helpers compile to C functions in the
+  same translation unit. Each root component is compiled independently
+  (no link-time sharing), so the same module imported by `app.tsx` and
+  `app.playdate.tsx` is folded twice, once per target build.
 - **Whole-list assignment**: `todos.value = todos.value.filter(...)` —
   views over one list always carry increasing pool indices, so the
   compiler emits an in-place compaction; new-array identity always
   triggers, matching Vue.
+- **Per-list static capacity**: every `ref<T[]>([...])` backs onto a
+  fixed-size pool. Unannotated, a list gets the target default (`poolCap`:
+  8 on NES, 32 on GBA/GB/ESP32/Playdate). A list that must grow past that —
+  a 12-row board, a 64-deep undo stack on NES — declares its own capacity
+  with the amphibious `withCapacity(seed, n)` host helper
+  (`ref<T[]>(withCapacity([...], 64))`). Under real Vue it is the identity
+  (the JS array is unbounded and the number is ignored); the compiler
+  declares that pool's C array with `n` records, compares the push guard
+  against `n`, and sizes every view derived from the list to `n`. Capacity
+  is per list (small pools stay small), must be a positive u8 compile-time
+  integer at least as large as the seed, and pushing past `n` still trips
+  `VP_TRIP_POOL_FULL` rather than overrunning.
 - Sugar: `+=`-family compound assignment (numbers and strings), `++`/`--`
   statements, negative `slice` ends.
 - Component = `setup()` returning a JSX render closure. One root component
@@ -174,7 +228,8 @@ Enforced with diagnostics, not documentation. In:
   `/` results are a compile error unless annotated — the demo needs none.
 
 Out (compile errors): closures escaping setup, dynamic property access,
-`any`, exceptions, async, classes, prototype anything, recursion in render,
+`any`, exceptions, async, classes, prototype anything, recursion in render
+or among setup helpers (the static call graph must be acyclic),
 `reactive()` deep proxies (v1 is `ref`-first; `reactive` is sugar the
 compiler can add later).
 

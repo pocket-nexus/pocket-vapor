@@ -14,7 +14,6 @@ int eventHandler(PlaydateAPI *playdate, PDSystemEvent event, uint32_t arg);
 const u8 vp_font_tiles[95 * 8] = {0};
 const u8 vp_palette_count = 2;
 const u8 vp_pal_style[2] = {0, 1};
-const char vp_app_title[] = "TEST";
 
 static int app_init_calls;
 static int app_flush_calls;
