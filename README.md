@@ -45,4 +45,4 @@ not include a bitmap-to-cartridge extractor. Its workflow is documented in
 - [Original experimental writeup](site/content/blog/pocket-vapor.md)
 - [ESP32 setup](vapor/runtime/esp32/README.md) and [Playdate setup](vapor/runtime/playdate/README.md)
 
-Extracted from [pocket-stack/pocketjs at d3f0be0c7739ea704ca25d8b5158581bb176abc6](https://github.com/pocket-stack/pocketjs/tree/d3f0be0c7739ea704ca25d8b5158581bb176abc6/vapor). Original source history remains there. The shared color palette and Vue JSX oracle adapter were made local during extraction. Source and maintained documentation media retain the original MIT license.
+Extracted from [pocket-nexus/pocketjs at d3f0be0c7739ea704ca25d8b5158581bb176abc6](https://github.com/pocket-nexus/pocketjs/tree/d3f0be0c7739ea704ca25d8b5158581bb176abc6/vapor). Original source history remains there. The shared color palette and Vue JSX oracle adapter were made local during extraction. Source and maintained documentation media retain the original MIT license.
